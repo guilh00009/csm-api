@@ -20,6 +20,21 @@ from models import Model, ModelArgs
 from generator import load_llama3_tokenizer, Segment
 from moshi.models import loaders
 
+# Explicitly check CUDA capabilities
+def get_best_dtype():
+    if not torch.cuda.is_available():
+        return torch.float32
+    
+    # Check for bfloat16 support first
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    # Fall back to float16 if bfloat16 not supported
+    else:
+        return torch.float16
+
+# Global dtype to ensure consistency across all tensors
+GLOBAL_DTYPE = get_best_dtype()
+print(f"Using {GLOBAL_DTYPE} precision for training")
 
 @dataclass
 class TrainingArgs:
@@ -218,7 +233,8 @@ def train_one_epoch(
     
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     for step, (frames, frames_mask, positions) in enumerate(progress_bar):
-        frames = frames.to(args.device)
+        # Move data to device and ensure correct dtype
+        frames = frames.to(args.device, dtype=GLOBAL_DTYPE)
         frames_mask = frames_mask.to(args.device)
         positions = positions.to(args.device)
         
@@ -276,7 +292,8 @@ def validate(
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation")
         for frames, frames_mask, positions in progress_bar:
-            frames = frames.to(args.device)
+            # Move data to device and ensure correct dtype
+            frames = frames.to(args.device, dtype=GLOBAL_DTYPE)
             frames_mask = frames_mask.to(args.device)
             positions = positions.to(args.device)
             
@@ -366,9 +383,8 @@ def main():
         audio_num_codebooks=args.audio_num_codebooks,
     )
     
-    # Set up model - ensure all tensors use the same dtype
-    model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    model = Model(model_args).to(device=args.device, dtype=model_dtype)
+    # Use the global dtype for the model to ensure consistency
+    model = Model(model_args).to(device=args.device, dtype=GLOBAL_DTYPE)
     
     # Apply activation checkpointing if enabled
     if args.checkpoint_activations:
@@ -436,6 +452,9 @@ def main():
         Returns:
             loss: scalar loss value
         """
+        # Ensure input tensors match model dtype
+        frames = frames.to(dtype=GLOBAL_DTYPE)
+        
         b, s, _ = frames.size()
         
         # Embed tokens
@@ -576,7 +595,13 @@ def main():
     
     # Setup KV caches for efficient training
     try:
-        model.setup_caches(args.batch_size)
+        # Setup caches with the proper dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            model.setup_caches(args.batch_size)
+            # Ensure KV caches use the same dtype as the model
+            for name, param in model.named_buffers():
+                if 'cache' in name:
+                    param.data = param.data.to(dtype=GLOBAL_DTYPE)
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
             print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
