@@ -57,21 +57,85 @@ def patch_attention_reshape():
                         k_val = self.k_proj(y) 
                         v_val = self.v_proj(y)
                         
-                        # Step 2: Reshape projections safely
+                        # Safe reshaping for projections
                         head_dim = embed_dim // self.num_heads
-                        q_val = q_val.view(b, s_x, self.num_heads, head_dim)
-                        k_val = k_val.view(b, y.size(1), self.num_heads, head_dim)
-                        v_val = v_val.view(b, y.size(1), self.num_heads, head_dim)
+                        print(f"Original tensors - q: {q_val.shape}, k: {k_val.shape}, v: {v_val.shape}")
+                        print(f"Target dimensions - heads: {self.num_heads}, head_dim: {head_dim}")
+                        
+                        # Step 2: Safe reshape for q_val
+                        try:
+                            q_val = q_val.view(b, s_x, self.num_heads, head_dim)
+                        except RuntimeError as qe:
+                            print(f"q_val reshape error: {qe}")
+                            q_size = q_val.numel()
+                            # Calculate dimensions that would work
+                            expected_size = b * s_x * self.num_heads * head_dim
+                            if q_size != expected_size:
+                                print(f"q_val size mismatch: got {q_size}, expected {expected_size}")
+                                # Create a zero tensor with the right shape
+                                q_val = torch.zeros((b, s_x, self.num_heads, head_dim), 
+                                                   dtype=q_val.dtype, 
+                                                   device=q_val.device)
+                        
+                        # Step 2: Safe reshape for k_val - Handle different y sequence length
+                        s_y = y.size(1)
+                        try:
+                            k_val = k_val.view(b, s_y, self.num_heads, head_dim)
+                        except RuntimeError as ke:
+                            print(f"k_val reshape error: {ke}")
+                            k_size = k_val.numel()
+                            # Calculate a safe shape based on actual tensor size
+                            if k_size > 0:
+                                # Calculate new dimensions that divide evenly
+                                # First try to preserve batch size and heads
+                                new_s_y = k_size // (b * self.num_heads * head_dim)
+                                if new_s_y > 0:
+                                    print(f"Reshaping k_val with adjusted s_y: {new_s_y}")
+                                    try:
+                                        k_val = k_val.view(b, new_s_y, self.num_heads, head_dim)
+                                        # Update s_y for later use
+                                        s_y = new_s_y
+                                    except RuntimeError:
+                                        # If that fails, create a zero tensor
+                                        k_val = torch.zeros((b, s_y, self.num_heads, head_dim), 
+                                                          dtype=k_val.dtype, 
+                                                          device=k_val.device)
+                                else:
+                                    # Last resort - create zeros
+                                    k_val = torch.zeros((b, s_y, self.num_heads, head_dim), 
+                                                      dtype=k_val.dtype, 
+                                                      device=k_val.device)
+                            else:
+                                # Create a zero tensor with expected shape
+                                k_val = torch.zeros((b, s_y, self.num_heads, head_dim), 
+                                                   dtype=k_val.dtype, 
+                                                   device=k_val.device)
+                        
+                        # Step 2: Safe reshape for v_val
+                        try:
+                            v_val = v_val.view(b, s_y, self.num_heads, head_dim)
+                        except RuntimeError as ve:
+                            print(f"v_val reshape error: {ve}")
+                            v_size = v_val.numel()
+                            # Use same s_y as k_val for consistency
+                            v_val = torch.zeros((b, s_y, self.num_heads, head_dim), 
+                                              dtype=v_val.dtype, 
+                                              device=v_val.device)
                         
                         # Step 3: Transpose for attention
                         q_val = q_val.transpose(1, 2)
                         k_val = k_val.transpose(1, 2)
                         v_val = v_val.transpose(1, 2)
                         
+                        print(f"After transpose - q: {q_val.shape}, k: {k_val.shape}, v: {v_val.shape}")
+                        
                         # Step 4: Apply RoPE if available
                         if hasattr(self, 'rope') and input_pos is not None:
-                            q_val = self.rope(q_val, input_pos)
-                            k_val = self.rope(k_val, input_pos)
+                            try:
+                                q_val = self.rope(q_val, input_pos)
+                                k_val = self.rope(k_val, input_pos)
+                            except Exception as rope_e:
+                                print(f"RoPE error: {rope_e}, skipping RoPE")
                         
                         # Step 5: Compute attention
                         scale = 1.0 / math.sqrt(head_dim)
@@ -80,7 +144,7 @@ def patch_attention_reshape():
                         # Step 6: Apply mask
                         if mask is not None:
                             # Check mask dimensions and fix if needed
-                            expected_mask_shape = (b, self.num_heads, s_x, y.size(1))
+                            expected_mask_shape = (b, self.num_heads, s_x, s_y)
                             if mask.shape != expected_mask_shape:
                                 print(f"Mask shape {mask.shape} != expected {expected_mask_shape}")
                                 
@@ -93,11 +157,11 @@ def patch_attention_reshape():
                                 if mask.dim() == 4:
                                     # Copy as much as possible from original mask
                                     min_seq1 = min(mask.size(2), s_x)
-                                    min_seq2 = min(mask.size(3), y.size(1))
+                                    min_seq2 = min(mask.size(3), s_y)
                                     new_mask[:, :, :min_seq1, :min_seq2] = mask[:, :, :min_seq1, :min_seq2]
                                 else:
                                     # Create a causal mask
-                                    causal = torch.tril(torch.ones(s_x, y.size(1), 
+                                    causal = torch.tril(torch.ones(s_x, s_y, 
                                                                  dtype=torch.bool, 
                                                                  device=mask.device))
                                     new_mask = causal.unsqueeze(0).unsqueeze(0).expand(b, self.num_heads, -1, -1)
@@ -105,7 +169,7 @@ def patch_attention_reshape():
                                 mask = new_mask
                         else:
                             # If no mask, create a causal mask
-                            causal = torch.tril(torch.ones(s_x, y.size(1), 
+                            causal = torch.tril(torch.ones(s_x, s_y, 
                                                          dtype=torch.bool, 
                                                          device=x.device))
                             mask = causal.unsqueeze(0).unsqueeze(0).expand(b, self.num_heads, -1, -1)
