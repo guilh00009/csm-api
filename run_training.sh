@@ -1,16 +1,42 @@
 #!/bin/bash
 
+# Set up error handling
+set -e  # Exit immediately if a command exits with a non-zero status
+trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"' ERR
+
 # Install dependencies
 echo "Installing dependencies..."
-bash install_dependencies.sh
+bash install_dependencies.sh || {
+    echo "Failed to install dependencies. You may need to install ffmpeg manually."
+    echo "Windows: Download from https://ffmpeg.org/download.html"
+    echo "Linux: sudo apt-get install ffmpeg"
+    echo "macOS: brew install ffmpeg"
+    echo "Continuing with the script..."
+}
+
+# Make sure Python environment variables are set correctly
+export PYTHONPATH="$(pwd):$PYTHONPATH"
 
 # Download and preprocess the dataset
 echo "Downloading and preprocessing the Switchboard dataset..."
 python preprocess_switchboard.py --download
 
+# Print some debug information
+echo "Python version:"
+python --version
+echo "Torch version:"
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, CUDA version: {torch.version.cuda if torch.cuda.is_available() else "N/A"}')"
+echo "Available CUDA devices:"
+python -c "import torch; print(f'Device count: {torch.cuda.device_count()}, Current device: {torch.cuda.current_device()} ({torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else "N/A"})')"
+echo "Memory info:"
+python -c "import torch; print(f'Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB') if torch.cuda.is_available() else print('CUDA not available')"
+
 # Run the training with memory-efficient settings
 echo "Starting training with memory-efficient settings..."
-python train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0
+# Set environment variable to disable tokenizers parallelism to avoid warnings
+export TOKENIZERS_PARALLELISM=false
+# Run with Python's -u flag for unbuffered output (better logging)
+python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0
 
 # If you want to resume training from a checkpoint, uncomment the line below
-# python train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 
+# python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 

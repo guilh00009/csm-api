@@ -452,12 +452,13 @@ def main():
         Returns:
             loss: scalar loss value
         """
-        # Ensure input tensors match model dtype
-        frames = frames.to(dtype=GLOBAL_DTYPE)
+        # Keep values as integers for embedding indices
+        # Only convert to GLOBAL_DTYPE for value tensors, not index tensors
+        frames_values = frames.to(dtype=GLOBAL_DTYPE)
         
         b, s, _ = frames.size()
         
-        # Embed tokens
+        # Embed tokens - pass original frames for indices
         embeds = self._embed_tokens(frames)
         masked_embeds = embeds * frames_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
@@ -596,7 +597,7 @@ def main():
     # Setup KV caches for efficient training
     try:
         # Setup caches with the proper dtype
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             model.setup_caches(args.batch_size)
             # Ensure KV caches use the same dtype as the model
             for name, param in model.named_buffers():

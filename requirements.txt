@@ -11,6 +11,6 @@ silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
 flask==2.3.3
 numpy>=1.26.0,<2.3
 tqdm>=4.66.0
-ffmpeg-python>=0.2.0
+ffmpeg-python==0.2.0
 # For Windows users, uncomment the line below and comment out the torch line above
 # triton-windows

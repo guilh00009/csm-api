@@ -87,7 +87,7 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
 
 def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs).exponential_(1)
-    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.long)  # Explicitly use long dtype
 
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
@@ -100,7 +100,8 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
     probs = torch.nn.functional.softmax(scores_processed, dim=-1)
 
     sample_token = _multinomial_sample_one_no_sync(probs)
-    return sample_token
+    # Ensure output is long integer type
+    return sample_token.long()
 
 
 @dataclass
@@ -204,12 +205,17 @@ class Model(nn.Module):
         self.decoder.reset_caches()
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
-        return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+        # Ensure indices are long type for embedding
+        indices = (tokens + codebook * self.args.audio_vocab_size).long()
+        return self.audio_embeddings(indices)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
+        # Ensure indices are long type for embedding
+        text_indices = tokens[:, :, -1].long()
+        text_embeds = self.text_embeddings(text_indices).unsqueeze(-2)
 
-        audio_tokens = tokens[:, :, :-1] + (
+        # Ensure audio indices are long type
+        audio_tokens = tokens[:, :, :-1].long() + (
             self.args.audio_vocab_size * torch.arange(self.args.audio_num_codebooks, device=tokens.device)
         )
         audio_embeds = self.audio_embeddings(audio_tokens.view(-1)).reshape(
