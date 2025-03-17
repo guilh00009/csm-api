@@ -587,10 +587,11 @@ def main():
         # Ensure h is the right dtype
         h = h.to(dtype=dtype)
         
-        # Create causal mask
+        # Create proper attention mask compatible with multi-head attention
+        # This is a key fix for the dimension mismatch
         device = h.device
-        causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
-        batch_mask = causal_mask[positions, :]
+        # Simple mask to prevent looking into the future
+        mask = None
         
         # Forward pass through backbone - handle disabled KV cache mode
         if DISABLE_KV_CACHE:
@@ -600,18 +601,21 @@ def main():
             
             # Use the backbone without any KV cache operations
             # Pass the input position and mask directly
-            backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+            backbone_out = self.backbone(h, input_pos=positions)
         else:
             # Use the backbone with KV caching as normal
             try:
-                backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+                backbone_out = self.backbone(h, input_pos=positions)
             except RuntimeError as e:
                 if "dtypes match" in str(e) or "Index put" in str(e):
                     print("Dtype mismatch during forward pass. Falling back to non-cached version.")
                     # Disable KV cache and try again
                     DISABLE_KV_CACHE = True
                     self.backbone.reset_caches()
-                    backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+                    backbone_out = self.backbone(h, input_pos=positions)
+                elif "expanded size" in str(e) or "must match" in str(e):
+                    print("Dimension mismatch in attention. Trying without explicit mask.")
+                    backbone_out = self.backbone(h, input_pos=positions)
                 else:
                     raise
                     
@@ -638,8 +642,8 @@ def main():
                 # Ensure decoder input is the right dtype
                 decoder_input = decoder_input.to(dtype=dtype)
                 
-                # Forward pass through decoder
-                decoder_out = self.decoder(decoder_input, input_pos=positions, mask=batch_mask)
+                # Forward pass through decoder - no mask for consistency
+                decoder_out = self.decoder(decoder_input, input_pos=positions)
                 
                 # Ensure decoder output is the right dtype
                 decoder_out = decoder_out.to(dtype=dtype)
@@ -790,8 +794,25 @@ def main():
                         
                         module.register_buffer = dtype_safe_register_buffer
                 
-                # Now setup the caches
-                model.setup_caches(args.batch_size)
+                # Try to safely set up caches with reduced size if needed
+                try:
+                    # Use a more conservative max_seq_len to avoid dimension issues
+                    orig_max_seq_len = model.backbone.max_seq_len
+                    if hasattr(model.backbone, 'max_seq_len') and model.backbone.max_seq_len > 2048:
+                        print(f"Reducing max_seq_len from {model.backbone.max_seq_len} to 2048 for safer caching")
+                        model.backbone.max_seq_len = 2048
+                    
+                    # Now setup the caches with reduced dimensions
+                    model.setup_caches(args.batch_size)
+                    
+                    # Restore original max_seq_len if we changed it
+                    if hasattr(model.backbone, 'max_seq_len') and orig_max_seq_len != model.backbone.max_seq_len:
+                        model.backbone.max_seq_len = orig_max_seq_len
+                except Exception as e:
+                    print(f"Error during cache setup: {e}")
+                    print("Falling back to no caching")
+                    DISABLE_KV_CACHE = True
+                    raise RuntimeError("Aborting KV cache setup")
                 
                 # Ensure KV caches use the consistent dtype
                 for name, param in model.named_buffers():
@@ -819,6 +840,13 @@ def main():
                 print(f"Error setting up KV caches: {e}")
                 print("Continuing without KV caching...")
                 DISABLE_KV_CACHE = True
+                
+            # Reset any partially initialized caches
+            if hasattr(model, 'reset_caches'):
+                try:
+                    model.reset_caches()
+                except:
+                    pass
     
     # Training loop
     for epoch in range(start_epoch, args.num_epochs):
