@@ -2,6 +2,10 @@ import argparse
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import multiprocessing
+
+# Fix multiprocessing to use 'spawn' method to avoid CUDA issues
+multiprocessing.set_start_method('spawn', force=True)
 
 import torch
 import torch.nn as nn
@@ -207,7 +211,7 @@ def train_one_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     args: TrainingArgs,
     epoch: int,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> float:
     model.train()
     total_loss = 0
@@ -219,7 +223,7 @@ def train_one_epoch(
         positions = positions.to(args.device)
         
         # Forward pass with mixed precision if enabled
-        with torch.cuda.amp.autocast(enabled=args.mixed_precision):
+        with torch.amp.autocast('cuda', enabled=args.mixed_precision):
             # For training, we need to implement a loss function
             # This is a placeholder - you'll need to adapt to your model's output
             loss = model.compute_loss(frames, frames_mask, positions)
@@ -276,7 +280,7 @@ def validate(
             frames_mask = frames_mask.to(args.device)
             positions = positions.to(args.device)
             
-            with torch.cuda.amp.autocast(enabled=args.mixed_precision):
+            with torch.amp.autocast('cuda', enabled=args.mixed_precision):
                 loss = model.compute_loss(frames, frames_mask, positions)
             
             total_loss += loss.item()
@@ -332,6 +336,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--cpu_offload", action="store_true", help="Offload optimizer states to CPU")
     parser.add_argument("--checkpoint_activations", action="store_true", help="Use activation checkpointing to save memory")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for data loading")
     args_cli = parser.parse_args()
     
     # Load config from file if provided
@@ -349,6 +354,8 @@ def main():
         args.cpu_offload = True
     if args_cli.checkpoint_activations:
         args.checkpoint_activations = True
+    if args_cli.num_workers is not None:
+        args.num_workers = args_cli.num_workers
     
     # Set up model
     model_args = ModelArgs(
@@ -359,7 +366,9 @@ def main():
         audio_num_codebooks=args.audio_num_codebooks,
     )
     
-    model = Model(model_args).to(device=args.device)
+    # Set up model - ensure all tensors use the same dtype
+    model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    model = Model(model_args).to(device=args.device, dtype=model_dtype)
     
     # Apply activation checkpointing if enabled
     if args.checkpoint_activations:
@@ -514,6 +523,7 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
     
     val_dataloader = DataLoader(
@@ -523,6 +533,7 @@ def main():
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
     
     # Set up optimizer and scheduler
