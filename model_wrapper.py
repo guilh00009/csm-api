@@ -112,8 +112,8 @@ def _apply_safety_patches(model):
             def safe_attention_call(self, *args, **kwargs):
                 """Make sure attention mask dimensions are compatible with scaled_dot_product_attention"""
                 try:
-                    # Extract mask from kwargs
-                    mask = kwargs.get('mask')
+                    # Extract mask from kwargs if it exists
+                    mask = kwargs.get('mask', None)
                     
                     # Check if we have a mask that needs reshaping
                     if mask is not None and not hasattr(mask, '_safe_mask_processed'):
@@ -130,100 +130,97 @@ def _apply_safety_patches(model):
                     return original_attention_call(self, *args, **kwargs)
                 except (RuntimeError, TypeError) as e:
                     err_msg = str(e)
+                    
                     if "multiple values for argument 'mask'" in err_msg:
-                        # This happens when mask is in both args and kwargs
-                        print(f"Fixing attention call: {err_msg}")
+                        # This happens when mask is passed both as a positional argument and in kwargs
+                        print("Fixing duplicate mask parameter issue")
                         
-                        # Inspect function signature to find mask position
-                        import inspect
-                        try:
-                            # Get the signature of the original function
-                            sig = inspect.signature(original_attention_call)
-                            param_names = list(sig.parameters.keys())[1:]  # Skip 'self'
+                        # Create new args and kwargs without mask duplication
+                        mask_from_kwargs = None
+                        if 'mask' in kwargs:
+                            mask_from_kwargs = kwargs.pop('mask')
                             
-                            # Find where 'mask' is in the parameters
-                            mask_index = -1
-                            if 'mask' in param_names:
-                                mask_index = param_names.index('mask')
-                            
-                            # Find if mask is already in args at the right position
-                            if mask_index >= 0 and len(args) > mask_index:
-                                # Remove mask from kwargs since it's in args
-                                if 'mask' in kwargs:
-                                    del kwargs['mask']
-                                return original_attention_call(self, *args, **kwargs)
-                        except Exception:
-                            # If we can't get the signature, use a more direct approach
-                            pass
-                            
-                        # Fallback method: create new args and kwargs without mask duplication
-                        new_args = list(args)
-                        # Remove 'mask' from kwargs and pass it only once
-                        new_kwargs = {k: v for k, v in kwargs.items() if k != 'mask'}
+                        # If we have at least 3 positional args, the mask is likely the 3rd argument
+                        # Let's just use the args directly with the modified kwargs (without mask)
+                        return original_attention_call(self, *args, **kwargs)
                         
-                        # Determine where to put the mask - either in args or kwargs
-                        # We'll put it in kwargs since that's typically safer
-                        if len(args) >= 3:
-                            # If we already have enough positional args, don't add mask to kwargs
-                            # It's likely already in the right position in args
-                            pass
-                        elif 'mask' in kwargs:
-                            # Add mask back to kwargs if it was there originally
-                            new_kwargs['mask'] = kwargs['mask']
-                        
-                        return original_attention_call(self, *new_args, **new_kwargs)
-                        
-                    elif "expanded size" in err_msg and 'mask' in kwargs:
+                    elif "expanded size" in err_msg:
                         # Handle dimension mismatch in attention mask
                         print(f"Fixing attention mask dimensions: {err_msg}")
                         
                         # Try to adapt the mask
-                        mask = kwargs.pop('mask', None)  # Remove mask from kwargs to avoid duplicate
+                        if 'mask' in kwargs:
+                            mask = kwargs.pop('mask')
+                            
+                            # Create a new kwarg dictionary without the mask
+                            new_kwargs = {k: v for k, v in kwargs.items() if k != 'mask'}
+                            
+                            # If mask is 3D, reshape it to 4D
+                            if mask is not None and len(mask.shape) == 3:
+                                mask = mask.unsqueeze(1)
+                            
+                            # If we have positional args that include mask, we need to replace it
+                            if len(args) >= 3:
+                                # Convert args to list so we can modify it
+                                args_list = list(args)
+                                
+                                # Add the reshaped mask back as a positional arg
+                                args_list[2] = mask
+                                
+                                # Return with modified positional args and new kwargs
+                                return original_attention_call(self, *args_list, **new_kwargs)
+                            else:
+                                # Add mask back to kwargs
+                                return original_attention_call(self, *args, mask=mask, **new_kwargs)
                         
-                        # If mask is 3D, reshape it to 4D
-                        if mask is not None and len(mask.shape) == 3:
-                            new_mask = mask.unsqueeze(1)
-                            # Call with modified mask
-                            return original_attention_call(self, *args, mask=new_mask, **kwargs)
+                        # If mask is not in kwargs, it might be in args
+                        elif len(args) >= 3:
+                            # Check the 3rd argument which should be the mask
+                            mask = args[2]
+                            if mask is not None and isinstance(mask, torch.Tensor):
+                                # Create a new args list
+                                args_list = list(args)
+                                
+                                # If mask is 3D, reshape it to 4D
+                                if len(mask.shape) == 3:
+                                    args_list[2] = mask.unsqueeze(1)
+                                
+                                # Return with modified args
+                                return original_attention_call(self, *args_list, **kwargs)
                         
-                        # If mask is 4D but has wrong sequence dimension, try to fix it
-                        if mask is not None and len(mask.shape) == 4:
-                            # Get q input to determine expected sequence length
-                            q = args[0] if len(args) > 0 else kwargs.get('q')
-                            if q is not None:
-                                seq_len = q.shape[1]
-                                # Create new causal mask with right dimensions
-                                device = mask.device
-                                causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-                                # Reshape for compatibility
-                                new_mask = causal_mask.unsqueeze(0).unsqueeze(1)
-                                # Call with fixed mask
-                                return original_attention_call(self, *args, mask=new_mask, **kwargs)
+                        # If we can't find or fix the mask, try without mask
+                        print("Could not fix mask, trying without it...")
+                        safe_kwargs = {k: v for k, v in kwargs.items() if k != 'mask'}
+                        if len(args) >= 3:
+                            # If args contain mask, pass the first two args only
+                            return original_attention_call(self, args[0], args[1], **safe_kwargs)
+                        else:
+                            # Just pass the args as is
+                            return original_attention_call(self, *args, **safe_kwargs)
                         
-                        # If we couldn't fix the mask, try without it
-                        print("Couldn't fix mask, trying without it...")
-                        return original_attention_call(self, *args, **kwargs)
                     else:
-                        # For other errors, try without KV caching
+                        # For other errors, disable KV cache
                         print(f"Attention error: {err_msg}")
+                        print("Disabling KV cache and retrying...")
                         
-                        # Try one more approach - completely disable KV caching
+                        # Access the global flag to disable KV cache
+                        import sys
+                        main_module = sys.modules.get('__main__')
+                        if hasattr(main_module, 'DISABLE_KV_CACHE'):
+                            main_module.DISABLE_KV_CACHE = True
+                        
+                        # Try one more time without KV cache-related arguments
+                        clean_kwargs = {k: v for k, v in kwargs.items() 
+                                      if k not in ['kv_cache', 'update_kv_cache']}
+                        
                         try:
-                            # Check if we can access the global flag
-                            import sys
-                            main_module = sys.modules.get('__main__')
-                            if hasattr(main_module, 'DISABLE_KV_CACHE'):
-                                print("Disabling KV cache globally...")
-                                main_module.DISABLE_KV_CACHE = True
-                            
-                            # Remove anything from kwargs that might interfere
-                            clean_kwargs = {k: v for k, v in kwargs.items() 
-                                          if k not in ['kv_cache', 'update_kv_cache']}
-                            
-                            # Try one last call with clean kwargs
+                            # If this fails too, let the original error propagate
                             return original_attention_call(self, *args, **clean_kwargs)
-                        except Exception:
-                            # If all else fails, propagate the original error
+                        except:
+                            # Fall back to standard approach without KV cache
+                            # Check if we can get the first 2 args (q and k)
+                            if len(args) >= 2:
+                                return original_attention_call(self, args[0], args[1])
                             raise
             
             # Bind the method to the module
