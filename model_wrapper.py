@@ -30,12 +30,15 @@ def patch_llama_before_import():
                 
                 # Direct fallback without relying on any existing code
                 with torch.no_grad():
+                    # Use CUDA if available, otherwise CPU
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    
                     # Calculate freqs directly
                     half_dim = self.dim // 2
-                    freqs = 1.0 / (10000.0 ** (torch.arange(0, half_dim, 2, device=self.device).float() / half_dim))
+                    freqs = 1.0 / (10000.0 ** (torch.arange(0, half_dim, 2, device=device).float() / half_dim))
                     
                     # Generate position indices
-                    seq_idx = torch.arange(self.max_seq_len, device=self.device).float()
+                    seq_idx = torch.arange(min(self.max_seq_len, 4096), device=device).float()
                     
                     # Calculate emb using broadcasting
                     emb = torch.outer(seq_idx, freqs)

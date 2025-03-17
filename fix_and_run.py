@@ -158,10 +158,12 @@ def _apply_rope_pre_patch():
             try:
                 original_rope_init(self)
             except Exception:
-                device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cpu')
-                half_dim = self.dim // 2
-                freqs = torch.arange(0, half_dim, 2, device=device).float()
-                freqs = 1.0 / (10000.0 ** (freqs / half_dim))
+                # Use CUDA if available, otherwise CPU
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                
+                half_dim = self.dim
+                freqs = torch.arange(0, half_dim // 2, 2, device=device).float()
+                freqs = 1.0 / (10000.0 ** (freqs / (half_dim // 2)))
                 seq_idx = torch.arange(min(self.max_seq_len, 4096), device=device).float()
                 emb = torch.outer(seq_idx, freqs)
                 self.register_buffer("cos_cached", torch.cos(emb).float(), persistent=False)

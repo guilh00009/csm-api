@@ -51,8 +51,8 @@ def patch_torchtune_rope():
                             # Ensure it's a 1D tensor
                             return freqs.reshape(-1)
                     else:
-                        # Get device safely from parameters
-                        device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cpu')
+                        # Get device in a safer way
+                        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
                         return torch.tensor([freqs], dtype=torch.float, device=device)
                 else:
                     raise
@@ -72,8 +72,8 @@ def patch_torchtune_rope():
                 print("Implementing fallback RoPE initialization...")
                 
                 with torch.no_grad():
-                    # Get device safely from parameters
-                    device = next(self.parameters()).device if hasattr(self, 'parameters') else torch.device('cpu')
+                    # Get device in a safer way that doesn't require self.device
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
                     
                     # Handle scalar tensors and standard initialization
                     half_dim = self.dim // 2
