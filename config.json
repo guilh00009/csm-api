@@ -5,8 +5,8 @@
     "audio_vocab_size": 2051,
     "audio_num_codebooks": 32,
     
-    "batch_size": 4,
-    "gradient_accumulation_steps": 8,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 16,
     "learning_rate": 3e-5,
     "weight_decay": 0.01,
     "num_epochs": 10,

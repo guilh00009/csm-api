@@ -27,8 +27,8 @@ class TrainingArgs:
     audio_num_codebooks: int = 32
     
     # Training parameters
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 8
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 16
     learning_rate: float = 3e-5
     weight_decay: float = 0.01
     num_epochs: int = 10
@@ -50,6 +50,10 @@ class TrainingArgs:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
     mixed_precision: bool = True
+    
+    # Memory optimization
+    cpu_offload: bool = False
+    checkpoint_activations: bool = False
 
 
 class SwitchboardDataset(Dataset):
@@ -323,6 +327,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train CSM-3B model on Switchboard dataset")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--cpu_offload", action="store_true", help="Offload optimizer states to CPU")
+    parser.add_argument("--checkpoint_activations", action="store_true", help="Use activation checkpointing to save memory")
     args_cli = parser.parse_args()
     
     # Load config from file if provided
@@ -335,6 +341,12 @@ def main():
                 if hasattr(args, key):
                     setattr(args, key, value)
     
+    # Override with command line arguments
+    if args_cli.cpu_offload:
+        args.cpu_offload = True
+    if args_cli.checkpoint_activations:
+        args.checkpoint_activations = True
+    
     # Set up model
     model_args = ModelArgs(
         backbone_flavor=args.backbone_flavor,
@@ -345,6 +357,58 @@ def main():
     )
     
     model = Model(model_args).to(device=args.device)
+    
+    # Apply activation checkpointing if enabled
+    if args.checkpoint_activations:
+        from torch.utils.checkpoint import checkpoint_sequential
+        
+        # Wrap the backbone with activation checkpointing
+        def forward_with_checkpointing(self, *args, **kwargs):
+            # Store original forward
+            original_forward = self.backbone.forward
+            
+            # Define a checkpointed forward function
+            def checkpointed_forward(*inner_args, **inner_kwargs):
+                # Split the backbone into chunks for checkpointing
+                num_layers = len(self.backbone.layers)
+                chunks = 4  # Number of chunks to split the model into
+                
+                # Apply checkpointing to each chunk
+                def create_custom_forward(start_idx, end_idx):
+                    def custom_forward(*custom_args):
+                        x = custom_args[0]
+                        for i in range(start_idx, end_idx):
+                            x = self.backbone.layers[i](x, inner_args[1], inner_args[2])
+                        return x
+                    return custom_forward
+                
+                # Process input through initial non-layer components
+                x = inner_args[0]
+                
+                # Process through checkpointed layer chunks
+                chunk_size = max(1, num_layers // chunks)
+                for i in range(0, num_layers, chunk_size):
+                    end_idx = min(i + chunk_size, num_layers)
+                    x = checkpoint(create_custom_forward(i, end_idx), x)
+                
+                # Process through final components
+                x = self.backbone.norm(x)
+                return x
+            
+            # Replace forward with checkpointed version temporarily
+            self.backbone.forward = checkpointed_forward
+            
+            # Call the model with the checkpointed forward
+            output = original_forward(*args, **kwargs)
+            
+            # Restore original forward
+            self.backbone.forward = original_forward
+            
+            return output
+        
+        # Monkey patch the model's forward method
+        model._original_forward = model.forward
+        model.forward = forward_with_checkpointing.__get__(model, Model)
     
     # Add compute_loss method to Model class
     def compute_loss(self, frames, frames_mask, positions):
@@ -459,11 +523,21 @@ def main():
     )
     
     # Set up optimizer and scheduler
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    if args.cpu_offload:
+        # Use CPU offloading for optimizer states
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        optimizer = ZeroRedundancyOptimizer(
+            model.parameters(),
+            optimizer_class=optim.AdamW,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
     
     total_steps = len(train_dataloader) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(
@@ -484,7 +558,14 @@ def main():
         print(f"Resumed from checkpoint: {args_cli.resume}")
     
     # Setup KV caches for efficient training
-    model.setup_caches(args.batch_size)
+    try:
+        model.setup_caches(args.batch_size)
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
+            # Continue without KV caches
+        else:
+            raise e
     
     # Training loop
     for epoch in range(start_epoch, args.num_epochs):

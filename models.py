@@ -132,11 +132,15 @@ class Model(nn.Module):
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
+        # Limit the maximum sequence length for caching to avoid OOM
+        max_cache_len = min(8192, self.backbone.max_seq_len)
+
         with device:
-            self.backbone.setup_caches(max_batch_size, dtype)
+            # Use a smaller max_seq_len for caching to avoid OOM
+            self.backbone.setup_caches(max_batch_size, dtype, max_seq_len=max_cache_len)
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
 
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
+        self.register_buffer("backbone_causal_mask", _create_causal_mask(max_cache_len, device))
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
 
     def generate_frame(
