@@ -18,7 +18,12 @@ from huggingface_hub import hf_hub_download
 
 # Apply patches for third-party libraries
 from patches import apply_all_patches
-apply_all_patches()
+PATCHES_APPLIED = apply_all_patches()
+
+# Flag to disable KV caching if patches fail
+DISABLE_KV_CACHE = not any("torchtune_kv_cache" in p for p in PATCHES_APPLIED)
+if DISABLE_KV_CACHE:
+    print("Warning: KV cache patch failed. Training will continue without KV caching.")
 
 from models import Model, ModelArgs
 from generator import load_llama3_tokenizer, Segment
@@ -217,8 +222,8 @@ def collate_fn(batch):
         padded_frames[i, :f.size(0)] = f
         padded_frames_mask[i, :m.size(0)] = m
     
-    # Create position indices
-    positions = torch.arange(0, max_len).unsqueeze(0).repeat(len(batch), 1)
+    # Create position indices - explicitly use long type
+    positions = torch.arange(0, max_len, dtype=torch.long).unsqueeze(0).repeat(len(batch), 1)
     
     return padded_frames, padded_frames_mask, positions
 
@@ -240,7 +245,9 @@ def train_one_epoch(
         # Move data to device and ensure correct dtype
         frames = frames.to(args.device, dtype=GLOBAL_DTYPE)
         frames_mask = frames_mask.to(args.device)
-        positions = positions.to(args.device)
+        
+        # Ensure positions tensor is long type to avoid index errors
+        positions = positions.long().to(args.device)
         
         # Forward pass with mixed precision if enabled
         with torch.amp.autocast('cuda', enabled=args.mixed_precision):
@@ -299,7 +306,9 @@ def validate(
             # Move data to device and ensure correct dtype
             frames = frames.to(args.device, dtype=GLOBAL_DTYPE)
             frames_mask = frames_mask.to(args.device)
-            positions = positions.to(args.device)
+            
+            # Ensure positions tensor is long type to avoid index errors
+            positions = positions.long().to(args.device)
             
             with torch.amp.autocast('cuda', enabled=args.mixed_precision):
                 loss = model.compute_loss(frames, frames_mask, positions)
@@ -472,8 +481,18 @@ def main():
         causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
         batch_mask = causal_mask[positions, :]
         
-        # Forward pass through backbone
-        backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+        # Forward pass through backbone - handle disabled KV cache mode
+        if DISABLE_KV_CACHE:
+            # For safety, ensure we're not using KV caches
+            if hasattr(self.backbone, 'caches_are_enabled') and self.backbone.caches_are_enabled():
+                self.backbone.reset_caches()
+            
+            # Use the backbone without any KV cache operations
+            # Pass the input position and mask directly
+            backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+        else:
+            # Use the backbone with KV caching as normal
+            backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
         
         # Compute loss for text tokens (last dimension)
         text_logits = self.text_embeddings.weight @ backbone_out.transpose(1, 2)
@@ -598,24 +617,28 @@ def main():
         )
         print(f"Resumed from checkpoint: {args_cli.resume}")
     
-    # Setup KV caches for efficient training
-    try:
-        # Setup caches with the proper dtype
-        with torch.amp.autocast('cuda', enabled=False):
-            model.setup_caches(args.batch_size)
-            # Ensure KV caches use the same dtype as the model
-            for name, param in model.named_buffers():
-                if 'cache' in name:
-                    param.data = param.data.to(dtype=GLOBAL_DTYPE)
-                # Ensure cache positions are Long to avoid index errors
-                if 'cache_pos' in name:
-                    param.data = param.data.long()
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
-            # Continue without KV caches
-        else:
-            raise e
+    # Setup KV caches for efficient training - only if patches were applied
+    if DISABLE_KV_CACHE:
+        print("KV caching is disabled. This may slow down training but should be more stable.")
+    else:
+        try:
+            # Setup caches with the proper dtype
+            with torch.amp.autocast('cuda', enabled=False):
+                model.setup_caches(args.batch_size)
+                # Ensure KV caches use the same dtype as the model
+                for name, param in model.named_buffers():
+                    if 'cache' in name:
+                        param.data = param.data.to(dtype=GLOBAL_DTYPE)
+                    # Ensure cache positions are Long to avoid index errors
+                    if 'cache_pos' in name:
+                        param.data = param.data.long()
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
+                # Continue without KV caches
+                DISABLE_KV_CACHE = True
+            else:
+                raise e
     
     # Training loop
     for epoch in range(start_epoch, args.num_epochs):

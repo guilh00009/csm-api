@@ -17,6 +17,12 @@ bash install_dependencies.sh || {
 # Make sure Python environment variables are set correctly
 export PYTHONPATH="$(pwd):$PYTHONPATH"
 
+# Check if patches.py exists
+if [ ! -f patches.py ]; then
+    echo "patches.py not found. This file is required to fix library compatibility issues."
+    exit 1
+fi
+
 # Download and preprocess the dataset
 echo "Downloading and preprocessing the Switchboard dataset..."
 python preprocess_switchboard.py --download
@@ -35,8 +41,9 @@ python -c "import torch; print(f'Memory allocated: {torch.cuda.memory_allocated(
 echo "Starting training with memory-efficient settings..."
 # Set environment variable to disable tokenizers parallelism to avoid warnings
 export TOKENIZERS_PARALLELISM=false
-# Run with Python's -u flag for unbuffered output (better logging)
-python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0
+
+# Run with more verbose error reporting
+python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 2>&1 | tee training_log.txt
 
 # If you want to resume training from a checkpoint, uncomment the line below
-# python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 
+# python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 2>&1 | tee training_log_resume.txt 
