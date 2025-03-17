@@ -10,6 +10,7 @@ import torchaudio
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from huggingface_hub import hf_hub_download
 
 from models import Model, ModelArgs
 from generator import load_llama3_tokenizer, Segment
@@ -19,16 +20,16 @@ from moshi.models import loaders
 @dataclass
 class TrainingArgs:
     # Model parameters
-    backbone_flavor: str = "llama-1B"
+    backbone_flavor: str = "llama-3B-instruct"
     decoder_flavor: str = "llama-100M"
     text_vocab_size: int = 128256
     audio_vocab_size: int = 2051
     audio_num_codebooks: int = 32
     
     # Training parameters
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 5e-5
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 3e-5
     weight_decay: float = 0.01
     num_epochs: int = 10
     warmup_steps: int = 1000
@@ -38,7 +39,7 @@ class TrainingArgs:
     dataset_path: str = "switchboard"
     train_split: str = "train"
     val_split: str = "validation"
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     
     # Logging and saving
     log_every: int = 100
@@ -319,7 +320,7 @@ def load_checkpoint(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train CSM-1B model on Switchboard dataset")
+    parser = argparse.ArgumentParser(description="Train CSM-3B model on Switchboard dataset")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args_cli = parser.parse_args()
@@ -417,7 +418,8 @@ def main():
     
     # Load audio tokenizer (MIMI)
     device = next(model.parameters()).device
-    mimi_weight = loaders.get_mimi_weights()
+    # Fix: Use the correct method to get MIMI weights
+    mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
     audio_tokenizer = loaders.get_mimi(mimi_weight, device=device)
     audio_tokenizer.set_num_codebooks(args.audio_num_codebooks)
     
