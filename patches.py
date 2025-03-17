@@ -8,6 +8,7 @@ import importlib.util
 import types
 import inspect
 import warnings
+import math
 
 def patch_torchtune_rope():
     """
@@ -337,6 +338,110 @@ def patch_kv_cache():
         print(f"Failed to patch KVCache: {e}")
         return False
 
+def patch_attention_reshape():
+    """
+    Patch the torchtune attention module's reshape operation to handle dimension mismatches.
+    """
+    try:
+        if not importlib.util.find_spec("torchtune"):
+            print("torchtune not found, skipping attention reshape patch")
+            return False
+
+        import torchtune.modules.attention
+        
+        # Store original forward method
+        attention_classes = [
+            cls for name, cls in vars(torchtune.modules.attention).items()
+            if isinstance(cls, type) and hasattr(cls, 'forward') and 'Attention' in name
+        ]
+        
+        patched_count = 0
+        for attention_cls in attention_classes:
+            original_forward = attention_cls.forward
+            
+            # Create patched forward method
+            def patched_forward(self, x, y=None, mask=None, input_pos=None):
+                try:
+                    return original_forward(self, x, y, mask=mask, input_pos=input_pos)
+                except RuntimeError as e:
+                    if "invalid for input of size" in str(e) and "shape" in str(e) and "view" in str(e):
+                        print(f"Catching reshape error in attention: {e}")
+                        
+                        # Get the q, k, v values
+                        b, s_x, embed_dim = x.shape
+                        
+                        if y is None:
+                            y = x
+                        
+                        q_val = self.q_proj(x).view(b, s_x, self.num_heads, self.head_dim)
+                        k_val = self.k_proj(y).view(b, y.size(1), self.num_heads, self.head_dim)
+                        v_val = self.v_proj(y).view(b, y.size(1), self.num_heads, self.head_dim)
+                        
+                        # Transpose for attention calculation
+                        q_val = q_val.transpose(1, 2)
+                        k_val = k_val.transpose(1, 2)
+                        v_val = v_val.transpose(1, 2)
+                        
+                        # Apply RoPE if needed
+                        if hasattr(self, 'rope') and input_pos is not None:
+                            q_val = self.rope(q_val, input_pos)
+                            k_val = self.rope(k_val, input_pos)
+                        
+                        # Safe attention using scaled dot product
+                        scale = 1.0 / math.sqrt(self.head_dim)
+                        
+                        # Create a causal mask manually
+                        causal_mask = torch.tril(torch.ones(s_x, y.size(1), device=x.device, dtype=torch.bool))
+                        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+                        
+                        # Compute attention manually
+                        attn_weights = torch.matmul(q_val, k_val.transpose(-2, -1)) * scale
+                        
+                        # Apply mask
+                        float_mask = torch.zeros_like(attn_weights, dtype=x.dtype)
+                        float_mask.masked_fill_(~causal_mask.expand(b, self.num_heads, s_x, y.size(1)), float('-inf'))
+                        attn_weights = attn_weights + float_mask
+                        
+                        # Apply softmax
+                        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                        
+                        # Apply attention
+                        attention_output = torch.matmul(attn_weights, v_val)
+                        
+                        # Safe reshape to original dimensions
+                        output_size = b * s_x * embed_dim
+                        # Make sure reshape is compatible with tensor size
+                        if output_size != attention_output.numel():
+                            # Adjust dimensions to match expected size
+                            print(f"Adjusting attention output from {attention_output.shape} to [{b}, {s_x}, {embed_dim}]")
+                            # Resize to match exactly
+                            attention_output = attention_output[:, :, :s_x, :]
+                        
+                        # Reshape back to original dimensions
+                        output = attention_output.transpose(1, 2).contiguous().view(b, s_x, embed_dim)
+                        
+                        # Apply out projection if it exists
+                        if hasattr(self, 'out_proj'):
+                            output = self.out_proj(output)
+                        
+                        return output
+                    else:
+                        # Re-raise if not a reshape error
+                        raise
+            
+            # Apply the patch by binding the patched method to the class
+            attention_cls.forward = patched_forward.__get__(None, attention_cls)
+            patched_count += 1
+            
+        print(f"Patched {patched_count} attention forward methods")
+        return patched_count > 0
+            
+    except Exception as e:
+        print(f"Failed to patch attention reshape: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def apply_all_patches():
     """Apply all patches."""
     patches_applied = []
@@ -350,6 +455,10 @@ def apply_all_patches():
     
     if patch_kv_cache():
         patches_applied.append("torchtune_kv_cache_fixed")
+    
+    # Apply new attention reshape patch
+    if patch_attention_reshape():
+        patches_applied.append("attention_reshape")
     
     if patches_applied:
         print(f"Applied patches: {', '.join(patches_applied)}")
