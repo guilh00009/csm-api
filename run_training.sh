@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Set environment variables for better error diagnosis
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1  # Improved CUDA debugging
+
 # Set up error handling
 set -e  # Exit immediately if a command exits with a non-zero status
 trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"' ERR
@@ -37,13 +41,9 @@ python -c "import torch; print(f'Device count: {torch.cuda.device_count()}, Curr
 echo "Memory info:"
 python -c "import torch; print(f'Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB, Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB') if torch.cuda.is_available() else print('CUDA not available')"
 
-# Run the training with memory-efficient settings
+# Run the training with memory-efficient and safe settings
 echo "Starting training with memory-efficient settings..."
-# Set environment variable to disable tokenizers parallelism to avoid warnings
-export TOKENIZERS_PARALLELISM=false
-
-# Run with more verbose error reporting
-python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 2>&1 | tee training_log.txt
+python train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0
 
 # If you want to resume training from a checkpoint, uncomment the line below
-# python -u train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 2>&1 | tee training_log_resume.txt 
+# python train.py --config config.json --checkpoint_activations --cpu_offload --num_workers 0 --resume checkpoints/checkpoint_latest.pt 

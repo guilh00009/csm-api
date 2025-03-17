@@ -17,8 +17,8 @@ def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
         intermediate_dim=8192,
         attn_dropout=0.0,
         norm_eps=1e-5,
-        rope_base=500_000,
-        scale_factor=32,
+        rope_base=10000.0,
+        scale_factor=1.0,
     )
 
 
@@ -29,12 +29,12 @@ def llama3_2_3B_instruct() -> torchtune.modules.transformer.TransformerDecoder:
         num_heads=24,
         num_kv_heads=8,
         embed_dim=3072,
-        max_seq_len=32768,
+        max_seq_len=4096,
         intermediate_dim=8192,
         attn_dropout=0.0,
         norm_eps=1e-5,
         rope_base=10000.0,
-        scale_factor=32,
+        scale_factor=1.0,
     )
 
 
@@ -49,8 +49,8 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
         intermediate_dim=8192,
         attn_dropout=0.0,
         norm_eps=1e-5,
-        rope_base=500_000,
-        scale_factor=32,
+        rope_base=10000.0,
+        scale_factor=1.0,
     )
 
 

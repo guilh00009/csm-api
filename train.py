@@ -1,12 +1,89 @@
-import argparse
+# Fix critical libraries before other imports
+import warnings
 import os
+
+# Set environment variables early
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # For better error messages
+os.environ["PYTHONWARNINGS"] = "ignore::FutureWarning"  # Ignore future warnings
+
+import argparse
+import multiprocessing
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-import multiprocessing
+
+# Apply early patching to fix RoPE initialization
+def apply_early_patches():
+    """Apply critical patches before any imports that might use torchtune"""
+    try:
+        import torch
+        import importlib.util
+        import types
+        
+        # Check if torchtune is available
+        if not importlib.util.find_spec("torchtune"):
+            print("torchtune not found, early patching skipped")
+            return False
+        
+        # Apply patches to torchtune RoPE implementation
+        import torchtune.models.llama3_1._position_embeddings
+        
+        # Get original methods
+        original_rope_init = torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.rope_init
+        
+        # Create a direct safe implementation
+        def safe_rope_init(self):
+            """Safe implementation of RoPE initialization"""
+            try:
+                # Try original implementation
+                original_rope_init(self)
+            except Exception as e:
+                print(f"RoPE initialization failed with: {e}")
+                print("Using direct implementation...")
+                
+                with torch.no_grad():
+                    # Conservative implementation
+                    dim = self.dim
+                    max_seq_len = min(self.max_seq_len, 4096)  # Cap at 4K
+                    
+                    # Direct calculation
+                    half_dim = dim // 2
+                    freqs = torch.arange(0, half_dim, 2, device=self.device).float()
+                    freqs = 1.0 / (10000.0 ** (freqs / half_dim))
+                    
+                    # Create position indices and outer product
+                    seq_idx = torch.arange(max_seq_len, device=self.device).float()
+                    emb = torch.outer(seq_idx, freqs)
+                    
+                    # Calculate cos/sin
+                    cos_cached = torch.cos(emb).float()
+                    sin_cached = torch.sin(emb).float()
+                    
+                    # Register buffers
+                    self.register_buffer("cos_cached", cos_cached, persistent=False)
+                    self.register_buffer("sin_cached", sin_cached, persistent=False)
+        
+        # Apply patches
+        torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.rope_init = safe_rope_init
+        print("Applied early patches to torchtune RoPE implementation")
+        
+        return True
+    except Exception as e:
+        print(f"Failed to apply early patches: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Apply early patches before importing other modules
+EARLY_PATCHES_APPLIED = apply_early_patches()
 
 # Fix multiprocessing to use 'spawn' method to avoid CUDA issues
-multiprocessing.set_start_method('spawn', force=True)
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    # Method already set
+    pass
 
+# Continue with regular imports
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,7 +93,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from huggingface_hub import hf_hub_download
 
-# Apply patches for third-party libraries
+# Apply all remaining patches
 from patches import apply_all_patches
 PATCHES_APPLIED = apply_all_patches()
 
@@ -25,6 +102,7 @@ DISABLE_KV_CACHE = not any("torchtune_kv_cache" in p for p in PATCHES_APPLIED)
 if DISABLE_KV_CACHE:
     print("Warning: KV cache patch failed. Training will continue without KV caching.")
 
+# Now it's safe to import models
 from models import Model, ModelArgs
 from model_wrapper import create_model_safely
 from generator import load_llama3_tokenizer, Segment

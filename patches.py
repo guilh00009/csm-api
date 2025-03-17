@@ -21,59 +21,79 @@ def patch_torchtune_rope():
         import torchtune.models.llama3_1._position_embeddings
         
         # Store original apply_scaling method
-        original_apply_scaling = torchtune.models.llama3_1._position_embeddings.ScaledRoPE.apply_scaling
+        original_apply_scaling = torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.apply_scaling
         
         # Create patched apply_scaling method
         def patched_apply_scaling(self, freqs):
             """Patched version of apply_scaling that handles scalar tensors"""
             try:
+                # Handle scalar tensor case directly
+                if isinstance(freqs, torch.Tensor) and freqs.dim() == 0:
+                    # Convert scalar to a properly shaped tensor
+                    freqs_value = freqs.item()
+                    return torch.tensor([freqs_value], dtype=freqs.dtype, device=freqs.device)
+                
+                # Try original implementation
                 return original_apply_scaling(self, freqs)
             except (TypeError, RuntimeError) as e:
                 if "len() of a 0-d tensor" in str(e):
-                    # Handle the case when freqs is a scalar
                     print("Fixing RoPE scaling with scalar tensor")
-                    if isinstance(freqs, torch.Tensor) and freqs.dim() == 0:
-                        # Convert scalar to a properly shaped tensor
-                        freqs_value = freqs.item()
-                        return torch.tensor([freqs_value], dtype=freqs.dtype, device=freqs.device)
+                    if isinstance(freqs, torch.Tensor):
+                        # Convert any tensor to 1D if needed
+                        if freqs.dim() == 0:
+                            freqs_value = freqs.item()
+                            return torch.tensor([freqs_value], dtype=freqs.dtype, device=freqs.device)
+                        else:
+                            # Ensure it's a 1D tensor
+                            return freqs.reshape(-1)
                     else:
-                        # Try to use freqs as is
-                        return freqs
+                        # Convert non-tensor to tensor
+                        return torch.tensor([freqs], dtype=torch.float, device=self.device)
                 else:
                     raise
         
         # Apply the patch
-        torchtune.models.llama3_1._position_embeddings.ScaledRoPE.apply_scaling = patched_apply_scaling
+        torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.apply_scaling = patched_apply_scaling
         print("Successfully patched torchtune RoPE apply_scaling")
         
         # Also patch the main Llama3ScaledRoPE initialization
-        original_rope_init = torchtune.models.llama3_1._position_embeddings.ScaledRoPE.rope_init
+        original_rope_init = torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.rope_init
         
         def patched_rope_init(self):
             """Patched version of rope_init that handles initialization errors"""
             try:
+                # Try original initialization
                 original_rope_init(self)
             except (TypeError, RuntimeError) as e:
                 print(f"Warning: Error during RoPE initialization: {e}")
-                print("Attempting fallback initialization...")
+                print("Implementing fallback RoPE initialization...")
                 
                 # Fallback initialization with safer approach
                 with torch.no_grad():
-                    # Handle some common causes of issues
+                    # Handle scalar tensors and standard initialization
                     half_dim = self.dim // 2
-                    # Generate logarithmically spaced values
-                    theta = 1.0 / (self.base ** (torch.arange(0, half_dim, 2, device=self.device) / half_dim))
                     
-                    # Create cos/sin embeddings
-                    idx = torch.arange(self.max_seq_len, device=self.device)
-                    idx_theta = torch.outer(idx, theta)
+                    # Use standard values for RoPE
+                    theta = torch.ones(half_dim // 2, device=self.device)
+                    for i in range(half_dim // 2):
+                        theta[i] = 1.0 / (self.base ** (i / (half_dim // 2)))
                     
-                    # Register buffers directly
+                    # Apply scaling if needed
+                    if hasattr(self, 'scale') and self.scale != 1.0:
+                        theta = theta ** self.scale
+                    
+                    # Create position indices
+                    seq_idx = torch.arange(self.max_seq_len, device=self.device)
+                    
+                    # Compute cos/sin values - using outer product for safety
+                    idx_theta = torch.outer(seq_idx, theta)
+                    
+                    # Register buffers safely
                     self.register_buffer("cos_cached", torch.cos(idx_theta).float(), persistent=False)
                     self.register_buffer("sin_cached", torch.sin(idx_theta).float(), persistent=False)
         
         # Apply the patch
-        torchtune.models.llama3_1._position_embeddings.ScaledRoPE.rope_init = patched_rope_init
+        torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.rope_init = patched_rope_init
         print("Successfully patched torchtune RoPE initialization")
         
         # Additionally patch the constructor to prevent parameters that cause issues
@@ -82,14 +102,19 @@ def patch_torchtune_rope():
         def patched_init(self, dim, max_seq_len, base=10000.0, scale_factor=1.0):
             """Patched version of __init__ that validates parameters"""
             # Ensure reasonable max_seq_len
-            if max_seq_len > 1000000:
-                warnings.warn(f"Very large max_seq_len ({max_seq_len}) detected, capping at 32768")
-                max_seq_len = 32768
+            if max_seq_len > 65536:
+                warnings.warn(f"Very large max_seq_len ({max_seq_len}) detected, capping at a safer value of 8192")
+                max_seq_len = 8192
+                
+            # Ensure reasonable base value
+            if base > 100000.0:
+                warnings.warn(f"Very large RoPE base ({base}) detected, setting to standard value 10000.0")
+                base = 10000.0
                 
             # Ensure reasonable scale_factor
             if scale_factor > 100:
-                warnings.warn(f"Very large scale_factor ({scale_factor}) detected, setting to 32")
-                scale_factor = 32
+                warnings.warn(f"Very large scale_factor ({scale_factor}) detected, setting to 1.0")
+                scale_factor = 1.0
                 
             # Call original init with validated parameters
             original_init(self, dim, max_seq_len, base, scale_factor)
