@@ -361,6 +361,7 @@ def main():
     # Apply activation checkpointing if enabled
     if args.checkpoint_activations:
         from torch.utils.checkpoint import checkpoint_sequential
+        from torch.utils.checkpoint import checkpoint
         
         # Wrap the backbone with activation checkpointing
         def forward_with_checkpointing(self, *args, **kwargs):
@@ -547,7 +548,10 @@ def main():
     )
     
     # Set up mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
+    if args.mixed_precision:
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
     
     # Resume from checkpoint if provided
     start_epoch = 0
