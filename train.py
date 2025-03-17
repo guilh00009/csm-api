@@ -16,6 +16,10 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from huggingface_hub import hf_hub_download
 
+# Apply patches for third-party libraries
+from patches import apply_all_patches
+apply_all_patches()
+
 from models import Model, ModelArgs
 from generator import load_llama3_tokenizer, Segment
 from moshi.models import loaders
@@ -603,6 +607,9 @@ def main():
             for name, param in model.named_buffers():
                 if 'cache' in name:
                     param.data = param.data.to(dtype=GLOBAL_DTYPE)
+                # Ensure cache positions are Long to avoid index errors
+                if 'cache_pos' in name:
+                    param.data = param.data.long()
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
             print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
