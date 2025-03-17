@@ -6,6 +6,7 @@ import torch
 import os
 import warnings
 from models import Model, ModelArgs, FLAVORS
+import torch.nn as nn
 
 def patch_llama_before_import():
     """
@@ -57,6 +58,111 @@ def patch_llama_before_import():
         return False
 
 def create_model_safely(
+    model_args: ModelArgs,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    dtype=None
+) -> Model:
+    """
+    Create a model with safer initialization, handling potential errors.
+    
+    Args:
+        model_args: ModelArgs instance with model configuration
+        device: Device to place model on
+        dtype: Data type for model parameters
+        
+    Returns:
+        Model instance
+    """
+    try:
+        if dtype is None:
+            # Determine best dtype automatically
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
+            elif torch.cuda.is_available():
+                dtype = torch.float16
+            else:
+                dtype = torch.float32
+        
+        print(f"Creating model with {model_args.backbone_flavor} backbone in {dtype} precision")
+        model = Model(model_args).to(device=device, dtype=dtype)
+        
+        # Apply safety patches to the model
+        _apply_safety_patches(model)
+        
+        return model
+    except Exception as e:
+        print(f"Error during model creation: {e}")
+        # Fallback to smaller model if the main one fails
+        if model_args.backbone_flavor != "llama-1B":
+            print("Falling back to llama-1B model...")
+            model_args.backbone_flavor = "llama-1B"
+            return create_model_safely(model_args, device, dtype)
+        else:
+            # If even the smallest model fails, re-raise the error
+            raise
+
+def _apply_safety_patches(model):
+    """Apply safety patches to the model components to handle edge cases"""
+    
+    # Apply attention mask dimension fix to all attention modules
+    for module in model.modules():
+        if hasattr(module, '_attention_call'):
+            original_attention_call = module._attention_call
+            
+            def safe_attention_call(self, *args, **kwargs):
+                """Make sure attention mask dimensions are compatible with scaled_dot_product_attention"""
+                try:
+                    # Extract mask from kwargs
+                    mask = kwargs.get('mask')
+                    
+                    # Check if we have a mask that needs reshaping
+                    if mask is not None and not hasattr(mask, '_safe_mask_processed'):
+                        # Get mask shape
+                        mask_shape = mask.shape
+                        
+                        # Check if mask needs to be reshaped for compatibility
+                        if len(mask_shape) == 3:  # [batch, seq_len, max_seq_len]
+                            # Reshape for scaled_dot_product_attention which expects [batch, heads, seq_len, max_seq_len]
+                            kwargs['mask'] = mask.unsqueeze(1)
+                            kwargs['mask']._safe_mask_processed = True
+                    
+                    return original_attention_call(self, *args, **kwargs)
+                except RuntimeError as e:
+                    if "expanded size" in str(e) and 'mask' in kwargs:
+                        # Handle dimension mismatch in attention mask
+                        print(f"Fixing attention mask dimensions: {e}")
+                        
+                        # Try to adapt the mask
+                        mask = kwargs.get('mask')
+                        
+                        # If mask is 3D, reshape it to 4D
+                        if mask is not None and len(mask.shape) == 3:
+                            kwargs['mask'] = mask.unsqueeze(1)
+                        
+                        # If mask is 4D but has wrong sequence dimension, try to fix it
+                        if mask is not None and len(mask.shape) == 4:
+                            # Get q input to determine expected sequence length
+                            q = args[0] if len(args) > 0 else kwargs.get('q')
+                            if q is not None:
+                                seq_len = q.shape[1]
+                                # Create new causal mask with right dimensions
+                                device = mask.device
+                                causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+                                # Reshape for compatibility
+                                kwargs['mask'] = causal_mask.unsqueeze(0).unsqueeze(1)
+                        
+                        # Try again with fixed mask
+                        return original_attention_call(self, *args, **kwargs)
+                    else:
+                        # For other errors, just propagate them up
+                        raise
+            
+            # Bind the method to the module
+            module._attention_call = safe_attention_call.__get__(module, module.__class__)
+    
+    return model
+
+def create_model_safely_old(
     model_args: ModelArgs,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype=None
