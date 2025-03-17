@@ -567,6 +567,9 @@ def main():
         Returns:
             loss: scalar loss value
         """
+        # Access global variables
+        global DISABLE_KV_CACHE
+        
         # Get model's dtype to ensure consistency
         dtype = next(self.parameters()).dtype
         
@@ -606,7 +609,6 @@ def main():
                 if "dtypes match" in str(e) or "Index put" in str(e):
                     print("Dtype mismatch during forward pass. Falling back to non-cached version.")
                     # Disable KV cache and try again
-                    global DISABLE_KV_CACHE
                     DISABLE_KV_CACHE = True
                     self.backbone.reset_caches()
                     backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
