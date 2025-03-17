@@ -636,7 +636,6 @@ def main():
                     print("Disabling KV cache and retrying...")
                     
                     # Disable KV cache globally for remaining training
-                    global DISABLE_KV_CACHE
                     DISABLE_KV_CACHE = True
                     
                     # Reset caches to prevent further issues
