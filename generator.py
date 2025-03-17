@@ -134,7 +134,7 @@ class Generator:
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
 
-        max_seq_len = 2048 - max_audio_frames
+        max_seq_len = min(self._model.backbone.max_seq_len, 8192) - max_audio_frames
         if curr_tokens.size(1) >= max_seq_len:
             raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
 
@@ -163,9 +163,9 @@ class Generator:
         return audio
 
 
-def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
+def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", backbone_flavor: str = "llama-3B-instruct") -> Generator:
     model_args = ModelArgs(
-        backbone_flavor="llama-1B",
+        backbone_flavor=backbone_flavor,
         decoder_flavor="llama-100M",
         text_vocab_size=128256,
         audio_vocab_size=2051,

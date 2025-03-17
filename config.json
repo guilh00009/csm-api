@@ -1,0 +1,28 @@
+{
+    "backbone_flavor": "llama-3B-instruct",
+    "decoder_flavor": "llama-100M",
+    "text_vocab_size": 128256,
+    "audio_vocab_size": 2051,
+    "audio_num_codebooks": 32,
+    
+    "batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 3e-5,
+    "weight_decay": 0.01,
+    "num_epochs": 10,
+    "warmup_steps": 1000,
+    "max_grad_norm": 1.0,
+    
+    "dataset_path": "switchboard",
+    "train_split": "train",
+    "val_split": "validation",
+    "max_seq_len": 4096,
+    
+    "log_every": 100,
+    "save_every": 1000,
+    "output_dir": "checkpoints",
+    
+    "device": "cuda",
+    "num_workers": 4,
+    "mixed_precision": true
+} 

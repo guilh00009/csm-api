@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../csm-api/static"
+		},
+		{
+			"path": "../../csm-api/templates"
+		}
+	],
+	"settings": {}
+}

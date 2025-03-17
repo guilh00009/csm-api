@@ -22,6 +22,22 @@ def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
     )
 
 
+def llama3_2_3B_instruct() -> torchtune.modules.transformer.TransformerDecoder:
+    return llama3_2.llama3_2(
+        vocab_size=128_256,
+        num_layers=28,
+        num_heads=24,
+        num_kv_heads=8,
+        embed_dim=3072,
+        max_seq_len=131072,
+        intermediate_dim=8192,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500_000,
+        scale_factor=32,
+    )
+
+
 def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
         vocab_size=128_256,
@@ -40,6 +56,7 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
 
 FLAVORS = {
     "llama-1B": llama3_2_1B,
+    "llama-3B-instruct": llama3_2_3B_instruct,
     "llama-100M": llama3_2_100M,
 }
 
