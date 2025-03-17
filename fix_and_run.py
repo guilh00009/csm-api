@@ -79,12 +79,49 @@ def apply_model_fixes():
                 f.write(content)
             print("Updated models.py with 1B parameters")
     
+    # Force disable KV cache
+    patches_file = "patches.py"
+    if os.path.exists(patches_file):
+        print("Updating patches.py to disable KV cache")
+        with open(patches_file, "a") as f:
+            f.write("\n\n# Force disable KV cache for stability\ndef force_disable_kv_cache():\n    global DISABLE_KV_CACHE\n    DISABLE_KV_CACHE = True\n    print('Forced KV cache disable for stability')\n\nforce_disable_kv_cache()\n")
+    
+    # Set environment variable to remind train.py to disable KV cache
+    os.environ["DISABLE_KV_CACHE"] = "1"
+    
     return True
+
+def create_run_without_kv_script():
+    """Create a simple train wrapper that runs without KV cache."""
+    script_content = """#!/usr/bin/env python
+import os
+import sys
+import torch
+
+# Force disable KV cache
+os.environ["DISABLE_KV_CACHE"] = "1"
+
+# Now import and run the regular training
+from train import DISABLE_KV_CACHE, main
+
+# Set global flag to disable KV cache
+DISABLE_KV_CACHE = True
+print("Running training with KV cache disabled")
+
+if __name__ == "__main__":
+    main()
+"""
+    with open("train_without_kv.py", "w") as f:
+        f.write(script_content)
+    print("Created train_without_kv.py to run training without KV cache")
 
 def run_training():
     """Run the training script with the 1B model parameters."""
     print("Starting training with 1B model parameters...")
-    cmd = ["python", "train.py", "--config", "config.json", "--checkpoint_activations", "--cpu_offload", "--num_workers", "0"]
+    
+    # First try with the wrapper script that disables KV cache
+    create_run_without_kv_script()
+    cmd = ["python", "train_without_kv.py", "--config", "config.json", "--checkpoint_activations", "--num_workers", "0"]
     
     print(f"Running command: {' '.join(cmd)}")
     subprocess.run(cmd)
