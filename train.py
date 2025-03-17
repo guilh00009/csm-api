@@ -678,13 +678,33 @@ def main():
     # Set up optimizer and scheduler
     if args.cpu_offload:
         # Use CPU offloading for optimizer states
-        from torch.distributed.optim import ZeroRedundancyOptimizer
-        optimizer = ZeroRedundancyOptimizer(
-            model.parameters(),
-            optimizer_class=optim.AdamW,
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        )
+        try:
+            import torch.distributed as dist
+            # Check if distributed is initialized
+            if not dist.is_available() or not dist.is_initialized():
+                print("Warning: Distributed environment not initialized. Falling back to standard optimizer.")
+                print("CPU offloading requires distributed training. Using regular AdamW instead.")
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                )
+            else:
+                from torch.distributed.optim import ZeroRedundancyOptimizer
+                optimizer = ZeroRedundancyOptimizer(
+                    model.parameters(),
+                    optimizer_class=optim.AdamW,
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                )
+                print("Using ZeroRedundancyOptimizer for CPU offloading")
+        except ImportError:
+            print("Warning: torch.distributed not available. Using regular AdamW optimizer.")
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
     else:
         optimizer = optim.AdamW(
             model.parameters(),
