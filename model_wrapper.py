@@ -126,6 +126,7 @@ def _apply_safety_patches(model):
                             kwargs['mask'] = mask.unsqueeze(1)
                             kwargs['mask']._safe_mask_processed = True
                     
+                    # Call the original attention method with the modified kwargs
                     return original_attention_call(self, *args, **kwargs)
                 except RuntimeError as e:
                     if "expanded size" in str(e) and 'mask' in kwargs:
@@ -133,11 +134,13 @@ def _apply_safety_patches(model):
                         print(f"Fixing attention mask dimensions: {e}")
                         
                         # Try to adapt the mask
-                        mask = kwargs.get('mask')
+                        mask = kwargs.pop('mask', None)  # Remove mask from kwargs to avoid duplicate
                         
                         # If mask is 3D, reshape it to 4D
                         if mask is not None and len(mask.shape) == 3:
-                            kwargs['mask'] = mask.unsqueeze(1)
+                            new_mask = mask.unsqueeze(1)
+                            # Call with modified mask
+                            return original_attention_call(self, *args, mask=new_mask, **kwargs)
                         
                         # If mask is 4D but has wrong sequence dimension, try to fix it
                         if mask is not None and len(mask.shape) == 4:
@@ -149,10 +152,27 @@ def _apply_safety_patches(model):
                                 device = mask.device
                                 causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
                                 # Reshape for compatibility
-                                kwargs['mask'] = causal_mask.unsqueeze(0).unsqueeze(1)
+                                new_mask = causal_mask.unsqueeze(0).unsqueeze(1)
+                                # Call with fixed mask
+                                return original_attention_call(self, *args, mask=new_mask, **kwargs)
                         
-                        # Try again with fixed mask
+                        # If we couldn't fix the mask, try without it
+                        print("Couldn't fix mask, trying without it...")
                         return original_attention_call(self, *args, **kwargs)
+                    elif "multiple values for argument 'mask'" in str(e):
+                        # Handle duplicate mask parameter
+                        print("Fixing duplicate mask parameter")
+                        
+                        # Remove mask from kwargs to avoid duplicate
+                        mask = kwargs.pop('mask', None)
+                        
+                        # Try to extract the mask from args if it's there
+                        if len(args) >= 3 and isinstance(args[2], torch.Tensor):
+                            # Already have mask in args, just pass args as is
+                            return original_attention_call(self, *args, **kwargs)
+                        else:
+                            # Put mask back as a kwarg
+                            return original_attention_call(self, *args, mask=mask, **kwargs)
                     else:
                         # For other errors, just propagate them up
                         raise
