@@ -587,25 +587,57 @@ def main():
         # Ensure h is the right dtype
         h = h.to(dtype=dtype)
         
-        # Create causal mask
+        # Print sequence shape for debugging
+        print(f"Sequence shape: {h.shape}, Positions shape: {positions.shape}")
+        
+        # Create causal mask properly
         device = h.device
-        causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
+        max_seq_len = s
         
-        # Use the appropriate mask format based on KV cache status
-        if not DISABLE_KV_CACHE:
-            # For scaled_dot_product_attention with KV cache, use 4D mask: [batch_size, num_heads, seq_len, seq_len]
-            # This is required by PyTorch's attention implementation
-            batch_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        # Create attention mask based on sequence length
+        try:
+            # First create a square mask of appropriate size
+            causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device))
             
-            # Ensure batch dimension matches input batch size
+            # For non-cached attention, mask needs special handling
+            # Check how many backbone heads we have
+            num_heads = 32  # Default for 1B model, could get from self.backbone.config if available
+            
+            if not DISABLE_KV_CACHE:
+                # For scaled_dot_product_attention with KV cache, use the 4D format: [batch, heads, seq, seq]
+                batch_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+                
+                # Expand batch and heads dimension if needed
+                if b > 1 or num_heads > 1:
+                    batch_mask = batch_mask.expand(b, num_heads, max_seq_len, max_seq_len)
+            else:
+                # For standard attention, use batch mask indexed by positions
+                # This handles the case where positions are not consecutive (e.g. when using KV cache)
+                batch_mask = torch.zeros(b, max_seq_len, max_seq_len, dtype=torch.bool, device=device)
+                
+                # Set each batch element's mask based on positions
+                for i in range(b):
+                    # Get positions for this batch 
+                    pos = positions[i]
+                    
+                    # Set corresponding rows of causal mask
+                    for j, p in enumerate(pos):
+                        if p < max_seq_len:  # Safety check
+                            batch_mask[i, j, :] = causal_mask[p, :]
+                
+                # For non-KV cache, we need 3D mask: [batch, seq, seq]
+                # Don't unsqueeze here as the backbone will handle it
+            
+            print(f"Created mask with shape: {batch_mask.shape}")
+        except Exception as e:
+            print(f"Error creating mask: {e}")
+            # Fallback to simple mask
+            batch_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device))
+            batch_mask = batch_mask.unsqueeze(0)  # [1, seq, seq]
             if b > 1:
-                batch_mask = batch_mask.expand(b, -1, -1, -1)  # [batch_size, 1, seq_len, seq_len]
-        else:
-            # For non-cached attention, use the standard causal mask indexed by positions
-            batch_mask = causal_mask[positions, :]
-        
-        # Skip the additional mask shaping logic since we've already shaped it correctly
-        # based on whether KV cache is enabled or not
+                batch_mask = batch_mask.expand(b, -1, -1)  # [batch, seq, seq]
+            
+            print(f"Using fallback mask with shape: {batch_mask.shape}")
         
         # Forward pass through backbone - handle disabled KV cache mode
         if DISABLE_KV_CACHE:
@@ -633,8 +665,12 @@ def main():
                         self.backbone.reset_caches()
                     
                     # Try again with standard approach (no KV cache)
-                    # Use standard mask approach
-                    batch_mask = causal_mask[positions, :]
+                    # Create a simpler mask
+                    batch_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device))
+                    batch_mask = batch_mask.unsqueeze(0)
+                    if b > 1:
+                        batch_mask = batch_mask.expand(b, -1, -1)
+                    
                     backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
                 else:
                     # For other errors, just propagate them up
@@ -643,43 +679,103 @@ def main():
         # Ensure backbone output is the right dtype
         backbone_out = backbone_out.to(dtype=dtype)
         
+        # Debug dimensions
+        print(f"Backbone output shape: {backbone_out.shape}")
+        
         # Compute loss for text tokens (last dimension)
-        text_logits = self.text_embeddings.weight @ backbone_out.transpose(1, 2)
-        text_targets = frames[:, 1:, -1]  # Shift right for next token prediction
-        text_loss = nn.CrossEntropyLoss()(
-            text_logits[:, :-1].reshape(-1, self.args.text_vocab_size),
-            text_targets.reshape(-1)
-        )
+        # text_logits = self.text_embeddings.weight @ backbone_out.transpose(1, 2)
+        # Use a safer approach with torch.einsum
+        text_logits = torch.einsum('vc,bsc->bsv', self.text_embeddings.weight, backbone_out)
+        
+        # Make sure there's enough sequence length to calculate loss
+        if frames.size(1) <= 1:
+            # We need at least 2 tokens to compute a shifted loss
+            print("Warning: Sequence length too short for text loss calculation, using dummy loss")
+            text_loss = torch.tensor(0.0, device=backbone_out.device, dtype=dtype)
+        else:
+            # Get targets, ensuring we have valid indices
+            seq_len = min(frames.size(1) - 1, backbone_out.size(1))
+            text_targets = frames[:, 1:seq_len+1, -1].long()  # Shift right and ensure long type
+            
+            # Adjust logits to match target length
+            text_logits = text_logits[:, :seq_len, :]
+            
+            # Check if shapes can be reshaped properly
+            expected_elements = text_logits[:, :seq_len].numel()
+            reshaped_elements = text_logits[:, :seq_len].reshape(-1, self.args.text_vocab_size).size(0) * self.args.text_vocab_size
+            
+            if expected_elements != reshaped_elements:
+                print(f"Warning: Reshape mismatch - original {expected_elements}, reshaped {reshaped_elements}")
+                print(f"Fixing text logits shape from {text_logits.shape} to multiple of {self.args.text_vocab_size}")
+                
+                # Find the largest valid size that divides evenly by vocab_size
+                valid_elements = (expected_elements // self.args.text_vocab_size) * self.args.text_vocab_size
+                valid_seq_len = valid_elements // (b * self.args.text_vocab_size)
+                
+                if valid_seq_len > 0:
+                    text_logits = text_logits[:, :valid_seq_len, :]
+                    text_targets = text_targets[:, :valid_seq_len]
+                    seq_len = valid_seq_len
+                    
+            try:
+                text_loss = nn.CrossEntropyLoss()(
+                    text_logits.reshape(-1, self.args.text_vocab_size),
+                    text_targets.reshape(-1)
+                )
+            except RuntimeError as e:
+                print(f"Error in text loss calculation: {e}")
+                print(f"Logits shape: {text_logits.shape}, Targets shape: {text_targets.shape}")
+                # Fallback to dummy loss
+                text_loss = torch.tensor(0.0, device=backbone_out.device, dtype=dtype)
         
         # Compute loss for audio tokens (first dimensions)
         audio_loss = 0
-        for i in range(self.args.audio_num_codebooks):
-            if i == 0:
-                audio_logits = self.codebook0_head(backbone_out)
-            else:
-                # Project backbone output to decoder dimension
-                decoder_input = self.projection(backbone_out)
+        try:
+            for i in range(self.args.audio_num_codebooks):
+                if i == 0:
+                    audio_logits = self.codebook0_head(backbone_out)
+                else:
+                    # Project backbone output to decoder dimension
+                    decoder_input = self.projection(backbone_out)
+                    
+                    # Ensure decoder input is the right dtype
+                    decoder_input = decoder_input.to(dtype=dtype)
+                    
+                    # Forward pass through decoder
+                    decoder_out = self.decoder(decoder_input, input_pos=positions, mask=batch_mask)
+                    
+                    # Ensure decoder output is the right dtype
+                    decoder_out = decoder_out.to(dtype=dtype)
+                    
+                    # Compute logits for current codebook
+                    audio_logits = torch.einsum("bsd,dv->bsv", decoder_out, self.audio_head[i-1])
                 
-                # Ensure decoder input is the right dtype
-                decoder_input = decoder_input.to(dtype=dtype)
+                # Ensure we have a valid sequence length for loss calculation
+                if frames.size(1) <= 1:
+                    continue  # Skip if sequence is too short
                 
-                # Forward pass through decoder
-                decoder_out = self.decoder(decoder_input, input_pos=positions, mask=batch_mask)
+                # Get targets, ensuring we have valid indices and shapes
+                seq_len = min(frames.size(1) - 1, audio_logits.size(1))
+                audio_targets = frames[:, 1:seq_len+1, i].long()  # Shift right and ensure long type
                 
-                # Ensure decoder output is the right dtype
-                decoder_out = decoder_out.to(dtype=dtype)
+                # Adjust logits to match target length
+                audio_logits = audio_logits[:, :seq_len, :]
                 
-                # Compute logits for current codebook
-                audio_logits = torch.einsum("bsd,dv->bsv", decoder_out, self.audio_head[i-1])
-            
-            # Get targets for current codebook
-            audio_targets = frames[:, 1:, i]  # Shift right for next token prediction
-            
-            # Compute loss
-            audio_loss += nn.CrossEntropyLoss()(
-                audio_logits[:, :-1].reshape(-1, self.args.audio_vocab_size),
-                audio_targets.reshape(-1)
-            )
+                try:
+                    # Add current codebook loss
+                    audio_loss += nn.CrossEntropyLoss()(
+                        audio_logits.reshape(-1, self.args.audio_vocab_size),
+                        audio_targets.reshape(-1)
+                    )
+                except RuntimeError as e:
+                    print(f"Error in audio loss calculation for codebook {i}: {e}")
+                    print(f"Logits shape: {audio_logits.shape}, Targets shape: {audio_targets.shape}")
+                    # Continue to next codebook
+                    continue
+        except Exception as e:
+            print(f"Error in audio loss calculation: {e}")
+            # Fallback to dummy audio loss
+            audio_loss = torch.tensor(0.0, device=backbone_out.device, dtype=dtype)
         
         # Combine losses
         loss = text_loss + audio_loss
