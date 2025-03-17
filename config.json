@@ -1,5 +1,5 @@
 {
-    "backbone_flavor": "llama-3B-instruct",
+    "backbone_flavor": "llama-1B",
     "decoder_flavor": "llama-100M",
     "text_vocab_size": 128256,
     "audio_vocab_size": 2051,
@@ -16,7 +16,7 @@
     "dataset_path": "switchboard",
     "train_split": "train",
     "val_split": "validation",
-    "max_seq_len": 4096,
+    "max_seq_len": 2048,
     
     "log_every": 100,
     "save_every": 1000,

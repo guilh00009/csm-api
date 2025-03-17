@@ -128,10 +128,54 @@ def _apply_safety_patches(model):
                     
                     # Call the original attention method with the modified kwargs
                     return original_attention_call(self, *args, **kwargs)
-                except RuntimeError as e:
-                    if "expanded size" in str(e) and 'mask' in kwargs:
+                except (RuntimeError, TypeError) as e:
+                    err_msg = str(e)
+                    if "multiple values for argument 'mask'" in err_msg:
+                        # This happens when mask is in both args and kwargs
+                        print(f"Fixing attention call: {err_msg}")
+                        
+                        # Inspect function signature to find mask position
+                        import inspect
+                        try:
+                            # Get the signature of the original function
+                            sig = inspect.signature(original_attention_call)
+                            param_names = list(sig.parameters.keys())[1:]  # Skip 'self'
+                            
+                            # Find where 'mask' is in the parameters
+                            mask_index = -1
+                            if 'mask' in param_names:
+                                mask_index = param_names.index('mask')
+                            
+                            # Find if mask is already in args at the right position
+                            if mask_index >= 0 and len(args) > mask_index:
+                                # Remove mask from kwargs since it's in args
+                                if 'mask' in kwargs:
+                                    del kwargs['mask']
+                                return original_attention_call(self, *args, **kwargs)
+                        except Exception:
+                            # If we can't get the signature, use a more direct approach
+                            pass
+                            
+                        # Fallback method: create new args and kwargs without mask duplication
+                        new_args = list(args)
+                        # Remove 'mask' from kwargs and pass it only once
+                        new_kwargs = {k: v for k, v in kwargs.items() if k != 'mask'}
+                        
+                        # Determine where to put the mask - either in args or kwargs
+                        # We'll put it in kwargs since that's typically safer
+                        if len(args) >= 3:
+                            # If we already have enough positional args, don't add mask to kwargs
+                            # It's likely already in the right position in args
+                            pass
+                        elif 'mask' in kwargs:
+                            # Add mask back to kwargs if it was there originally
+                            new_kwargs['mask'] = kwargs['mask']
+                        
+                        return original_attention_call(self, *new_args, **new_kwargs)
+                        
+                    elif "expanded size" in err_msg and 'mask' in kwargs:
                         # Handle dimension mismatch in attention mask
-                        print(f"Fixing attention mask dimensions: {e}")
+                        print(f"Fixing attention mask dimensions: {err_msg}")
                         
                         # Try to adapt the mask
                         mask = kwargs.pop('mask', None)  # Remove mask from kwargs to avoid duplicate
@@ -159,23 +203,28 @@ def _apply_safety_patches(model):
                         # If we couldn't fix the mask, try without it
                         print("Couldn't fix mask, trying without it...")
                         return original_attention_call(self, *args, **kwargs)
-                    elif "multiple values for argument 'mask'" in str(e):
-                        # Handle duplicate mask parameter
-                        print("Fixing duplicate mask parameter")
-                        
-                        # Remove mask from kwargs to avoid duplicate
-                        mask = kwargs.pop('mask', None)
-                        
-                        # Try to extract the mask from args if it's there
-                        if len(args) >= 3 and isinstance(args[2], torch.Tensor):
-                            # Already have mask in args, just pass args as is
-                            return original_attention_call(self, *args, **kwargs)
-                        else:
-                            # Put mask back as a kwarg
-                            return original_attention_call(self, *args, mask=mask, **kwargs)
                     else:
-                        # For other errors, just propagate them up
-                        raise
+                        # For other errors, try without KV caching
+                        print(f"Attention error: {err_msg}")
+                        
+                        # Try one more approach - completely disable KV caching
+                        try:
+                            # Check if we can access the global flag
+                            import sys
+                            main_module = sys.modules.get('__main__')
+                            if hasattr(main_module, 'DISABLE_KV_CACHE'):
+                                print("Disabling KV cache globally...")
+                                main_module.DISABLE_KV_CACHE = True
+                            
+                            # Remove anything from kwargs that might interfere
+                            clean_kwargs = {k: v for k, v in kwargs.items() 
+                                          if k not in ['kv_cache', 'update_kv_cache']}
+                            
+                            # Try one last call with clean kwargs
+                            return original_attention_call(self, *args, **clean_kwargs)
+                        except Exception:
+                            # If all else fails, propagate the original error
+                            raise
             
             # Bind the method to the module
             module._attention_call = safe_attention_call.__get__(module, module.__class__)

@@ -130,7 +130,7 @@ print(f"Using {GLOBAL_DTYPE} precision for training")
 @dataclass
 class TrainingArgs:
     # Model parameters
-    backbone_flavor: str = "llama-3B-instruct"
+    backbone_flavor: str = "llama-1B"
     decoder_flavor: str = "llama-100M"
     text_vocab_size: int = 128256
     audio_vocab_size: int = 2051
@@ -590,32 +590,22 @@ def main():
         # Create causal mask
         device = h.device
         causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
-        batch_mask = causal_mask[positions, :]
         
-        # Create properly sized mask for attention mechanism
-        # The error indicates a mismatch between mask dimensions and attention dimensions
-        # Ensure mask is compatible with torchtune's attention implementation
+        # Use the appropriate mask format based on KV cache status
         if not DISABLE_KV_CACHE:
-            try:
-                # Check if we can get max sequence length from the backbone
-                max_seq_len = getattr(self.backbone, 'max_seq_len', 4096)
-                
-                # If mask might be treated as a 4D tensor in attention mechanism, prepare it correctly
-                # First check if batch_mask dimensions are compatible with attention
-                if hasattr(self.backbone, 'caches_are_enabled') and self.backbone.caches_are_enabled():
-                    # When caches are enabled, we need to ensure mask can be broadcast correctly
-                    # Get current sequence positions for proper indexing
-                    curr_pos = positions.clone()
-                    
-                    # Use full causal mask instead of indexed version for KV cache mode
-                    batch_mask = causal_mask[:curr_pos.shape[1], :max_seq_len]
-                    
-                    # Ensure mask is properly shaped for attention with KV cache
-                    # This allows proper broadcasting in scaled_dot_product_attention
-                    batch_mask = batch_mask.unsqueeze(0).unsqueeze(1)  # [1, 1, seq_len, max_seq_len]
-            except Exception as e:
-                print(f"Warning: Error preparing attention mask: {e}")
-                print("Continuing with standard mask...")
+            # For scaled_dot_product_attention with KV cache, use 4D mask: [batch_size, num_heads, seq_len, seq_len]
+            # This is required by PyTorch's attention implementation
+            batch_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+            
+            # Ensure batch dimension matches input batch size
+            if b > 1:
+                batch_mask = batch_mask.expand(b, -1, -1, -1)  # [batch_size, 1, seq_len, seq_len]
+        else:
+            # For non-cached attention, use the standard causal mask indexed by positions
+            batch_mask = causal_mask[positions, :]
+        
+        # Skip the additional mask shaping logic since we've already shaped it correctly
+        # based on whether KV cache is enabled or not
         
         # Forward pass through backbone - handle disabled KV cache mode
         if DISABLE_KV_CACHE:
