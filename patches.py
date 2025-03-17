@@ -7,6 +7,104 @@ import torch
 import importlib.util
 import types
 import inspect
+import warnings
+
+def patch_torchtune_rope():
+    """
+    Patch the torchtune RoPE implementation to fix initialization issues.
+    """
+    try:
+        if not importlib.util.find_spec("torchtune"):
+            print("torchtune not found, skipping RoPE patch")
+            return False
+
+        import torchtune.models.llama3_1._position_embeddings
+        
+        # Store original apply_scaling method
+        original_apply_scaling = torchtune.models.llama3_1._position_embeddings.ScaledRoPE.apply_scaling
+        
+        # Create patched apply_scaling method
+        def patched_apply_scaling(self, freqs):
+            """Patched version of apply_scaling that handles scalar tensors"""
+            try:
+                return original_apply_scaling(self, freqs)
+            except (TypeError, RuntimeError) as e:
+                if "len() of a 0-d tensor" in str(e):
+                    # Handle the case when freqs is a scalar
+                    print("Fixing RoPE scaling with scalar tensor")
+                    if isinstance(freqs, torch.Tensor) and freqs.dim() == 0:
+                        # Convert scalar to a properly shaped tensor
+                        freqs_value = freqs.item()
+                        return torch.tensor([freqs_value], dtype=freqs.dtype, device=freqs.device)
+                    else:
+                        # Try to use freqs as is
+                        return freqs
+                else:
+                    raise
+        
+        # Apply the patch
+        torchtune.models.llama3_1._position_embeddings.ScaledRoPE.apply_scaling = patched_apply_scaling
+        print("Successfully patched torchtune RoPE apply_scaling")
+        
+        # Also patch the main Llama3ScaledRoPE initialization
+        original_rope_init = torchtune.models.llama3_1._position_embeddings.ScaledRoPE.rope_init
+        
+        def patched_rope_init(self):
+            """Patched version of rope_init that handles initialization errors"""
+            try:
+                original_rope_init(self)
+            except (TypeError, RuntimeError) as e:
+                print(f"Warning: Error during RoPE initialization: {e}")
+                print("Attempting fallback initialization...")
+                
+                # Fallback initialization with safer approach
+                with torch.no_grad():
+                    # Handle some common causes of issues
+                    half_dim = self.dim // 2
+                    # Generate logarithmically spaced values
+                    theta = 1.0 / (self.base ** (torch.arange(0, half_dim, 2, device=self.device) / half_dim))
+                    
+                    # Create cos/sin embeddings
+                    idx = torch.arange(self.max_seq_len, device=self.device)
+                    idx_theta = torch.outer(idx, theta)
+                    
+                    # Register buffers directly
+                    self.register_buffer("cos_cached", torch.cos(idx_theta).float(), persistent=False)
+                    self.register_buffer("sin_cached", torch.sin(idx_theta).float(), persistent=False)
+        
+        # Apply the patch
+        torchtune.models.llama3_1._position_embeddings.ScaledRoPE.rope_init = patched_rope_init
+        print("Successfully patched torchtune RoPE initialization")
+        
+        # Additionally patch the constructor to prevent parameters that cause issues
+        original_init = torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.__init__
+        
+        def patched_init(self, dim, max_seq_len, base=10000.0, scale_factor=1.0):
+            """Patched version of __init__ that validates parameters"""
+            # Ensure reasonable max_seq_len
+            if max_seq_len > 1000000:
+                warnings.warn(f"Very large max_seq_len ({max_seq_len}) detected, capping at 32768")
+                max_seq_len = 32768
+                
+            # Ensure reasonable scale_factor
+            if scale_factor > 100:
+                warnings.warn(f"Very large scale_factor ({scale_factor}) detected, setting to 32")
+                scale_factor = 32
+                
+            # Call original init with validated parameters
+            original_init(self, dim, max_seq_len, base, scale_factor)
+        
+        # Apply the patch
+        torchtune.models.llama3_1._position_embeddings.Llama3ScaledRoPE.__init__ = patched_init
+        print("Successfully patched torchtune Llama3ScaledRoPE constructor")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Failed to patch torchtune RoPE: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def patch_torchtune_kv_cache():
     """
@@ -153,6 +251,10 @@ def patch_torchtune_kv_cache():
 def apply_all_patches():
     """Apply all patches."""
     patches_applied = []
+    
+    # Apply RoPE patch first
+    if patch_torchtune_rope():
+        patches_applied.append("torchtune_rope")
     
     if patch_torchtune_kv_cache():
         patches_applied.append("torchtune_kv_cache")

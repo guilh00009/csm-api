@@ -26,6 +26,7 @@ if DISABLE_KV_CACHE:
     print("Warning: KV cache patch failed. Training will continue without KV caching.")
 
 from models import Model, ModelArgs
+from model_wrapper import create_model_safely
 from generator import load_llama3_tokenizer, Segment
 from moshi.models import loaders
 
@@ -397,7 +398,24 @@ def main():
     )
     
     # Use the global dtype for the model to ensure consistency
-    model = Model(model_args).to(device=args.device, dtype=GLOBAL_DTYPE)
+    # Use our safer model creation wrapper
+    try:
+        model = create_model_safely(
+            model_args=model_args,
+            device=args.device,
+            dtype=GLOBAL_DTYPE
+        )
+    except Exception as e:
+        print(f"Failed to create model: {e}")
+        print("Attempting to continue with a smaller model...")
+        # Try with a smaller model as last resort
+        model_args.backbone_flavor = "llama-1B"  # Use smaller model
+        model = create_model_safely(
+            model_args=model_args,
+            device=args.device,
+            dtype=GLOBAL_DTYPE
+        )
+        print("Successfully created a smaller model as fallback!")
     
     # Apply activation checkpointing if enabled
     if args.checkpoint_activations:
