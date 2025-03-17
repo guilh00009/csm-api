@@ -96,6 +96,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from huggingface_hub import hf_hub_download
 
+# Import tensor utilities
+from tensor_utils import create_causal_mask, ensure_tensor_dtype, make_compatible_mask, try_compatible_shapes
+
 # Apply all remaining patches
 from patches import apply_all_patches
 PATCHES_APPLIED = apply_all_patches()
@@ -587,11 +590,9 @@ def main():
         # Ensure h is the right dtype
         h = h.to(dtype=dtype)
         
-        # Create proper causal mask for attention - critical for KV cache mode
+        # Create causal mask using our utility function - 4D format for transformer attention
         device = h.device
-        # Simple causal mask - prevent looking into the future
-        # This proper triangular mask is needed for KV caching
-        causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
+        causal_mask = create_causal_mask(s, device, format_type="4d")
         
         # Forward pass through backbone - handle disabled KV cache mode
         if DISABLE_KV_CACHE:
@@ -599,12 +600,14 @@ def main():
             if hasattr(self.backbone, 'caches_are_enabled') and self.backbone.caches_are_enabled():
                 self.backbone.reset_caches()
             
-            # Use the backbone without any KV cache operations
-            backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
+            # Use our try_compatible_shapes utility to handle shape mismatches
+            def backbone_forward(h, input_pos, mask):
+                return self.backbone(h, input_pos=input_pos, mask=mask)
+            
+            backbone_out = try_compatible_shapes(backbone_forward, h, input_pos=positions, mask=causal_mask)
         else:
             # Use the backbone with KV caching as normal
             try:
-                # When using KV cache, a causal mask is required
                 backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
             except RuntimeError as e:
                 if "dtypes match" in str(e) or "Index put" in str(e):
@@ -612,14 +615,12 @@ def main():
                     # Disable KV cache and try again
                     DISABLE_KV_CACHE = True
                     self.backbone.reset_caches()
-                    backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
-                elif "expanded size" in str(e) or "must match" in str(e):
-                    print("Dimension mismatch in attention. Disabling KV cache and trying again.")
-                    DISABLE_KV_CACHE = True
-                    self.backbone.reset_caches()
-                    backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
+                    # Use our try_compatible_shapes utility to handle shape mismatches
+                    def backbone_forward(h, input_pos, mask):
+                        return self.backbone(h, input_pos=input_pos, mask=mask)
+                    
+                    backbone_out = try_compatible_shapes(backbone_forward, h, input_pos=positions, mask=causal_mask)
                 else:
-                    print(f"Unknown error during backbone forward pass: {e}")
                     raise
                     
         # Ensure backbone output is the right dtype
@@ -643,13 +644,21 @@ def main():
                 decoder_input = self.projection(backbone_out)
                 
                 # Ensure decoder input is the right dtype
-                decoder_input = decoder_input.to(dtype=dtype)
+                decoder_input = ensure_tensor_dtype(decoder_input, dtype, "decoder_input")
                 
-                # Forward pass through decoder - include causal mask
-                decoder_out = self.decoder(decoder_input, input_pos=positions, mask=causal_mask)
+                # Forward pass through decoder using our utility for shape handling
+                def decoder_forward(decoder_input, input_pos, mask):
+                    return self.decoder(decoder_input, input_pos=input_pos, mask=mask)
+                
+                decoder_out = try_compatible_shapes(
+                    decoder_forward, 
+                    decoder_input, 
+                    input_pos=positions, 
+                    mask=causal_mask
+                )
                 
                 # Ensure decoder output is the right dtype
-                decoder_out = decoder_out.to(dtype=dtype)
+                decoder_out = ensure_tensor_dtype(decoder_out, dtype, "decoder_output")
                 
                 # Compute logits for current codebook
                 audio_logits = torch.einsum("bsd,dv->bsv", decoder_out, self.audio_head[i-1])
@@ -797,28 +806,8 @@ def main():
                         
                         module.register_buffer = dtype_safe_register_buffer
                 
-                # Try to safely set up caches with reduced size if needed
-                max_cache_len = 512  # Very conservative to start
-                
-                try:
-                    # Use a more conservative max_seq_len to avoid dimension issues
-                    orig_max_seq_len = model.backbone.max_seq_len
-                    if hasattr(model.backbone, 'max_seq_len') and model.backbone.max_seq_len > max_cache_len:
-                        print(f"Reducing max_seq_len from {model.backbone.max_seq_len} to {max_cache_len} for safer caching")
-                        model.backbone.max_seq_len = max_cache_len
-                    
-                    # Now setup the caches with reduced dimensions
-                    model.setup_caches(args.batch_size)
-                    
-                    # Restore original max_seq_len if we changed it
-                    if hasattr(model.backbone, 'max_seq_len') and orig_max_seq_len != model.backbone.max_seq_len:
-                        model.backbone.max_seq_len = orig_max_seq_len
-                        print(f"Restored original max_seq_len: {orig_max_seq_len}")
-                except Exception as e:
-                    print(f"Error during cache setup: {e}")
-                    print("Falling back to no caching")
-                    DISABLE_KV_CACHE = True
-                    raise RuntimeError("Aborting KV cache setup")
+                # Now setup the caches
+                model.setup_caches(args.batch_size)
                 
                 # Ensure KV caches use the consistent dtype
                 for name, param in model.named_buffers():
@@ -829,13 +818,6 @@ def main():
                     # Ensure cache positions are Long to avoid index errors
                     if 'cache_pos' in name:
                         param.data = param.data.long()
-                
-                # Make sure Model has proper causal_mask buffer for attention
-                # Create a conservative causal mask buffer for use during training
-                if not hasattr(model, 'causal_mask') or model.causal_mask.size(0) < max_cache_len:
-                    print(f"Creating causal mask buffer with size {max_cache_len}")
-                    causal_mask = torch.tril(torch.ones(max_cache_len, max_cache_len, dtype=torch.bool, device=args.device))
-                    model.register_buffer('causal_mask', causal_mask, persistent=False)
                 
                 # Restore original register_buffer method
                 for module in model.modules():
@@ -853,13 +835,6 @@ def main():
                 print(f"Error setting up KV caches: {e}")
                 print("Continuing without KV caching...")
                 DISABLE_KV_CACHE = True
-                
-            # Reset any partially initialized caches
-            if hasattr(model, 'reset_caches'):
-                try:
-                    model.reset_caches()
-                except:
-                    pass
     
     # Training loop
     for epoch in range(start_epoch, args.num_epochs):

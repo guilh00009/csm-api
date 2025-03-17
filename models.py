@@ -134,7 +134,7 @@ class Model(nn.Module):
         device = next(self.parameters()).device
 
         # Limit the maximum sequence length for caching to avoid OOM
-        max_cache_len = min(512, self.backbone.max_seq_len)
+        max_cache_len = min(8192, self.backbone.max_seq_len)
 
         with device:
             # The TransformerDecoder.setup_caches() doesn't accept max_seq_len parameter
@@ -143,13 +143,8 @@ class Model(nn.Module):
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
 
         # Still use the limited max_cache_len for the causal mask
-        causal_mask = _create_causal_mask(max_cache_len, device)
-        self.register_buffer("backbone_causal_mask", causal_mask, persistent=False)
-        self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device), persistent=False)
-        
-        # Print some debug info about the caches
-        print(f"KV caches setup with max_batch_size={max_batch_size}, dtype={dtype}, max_cache_len={max_cache_len}")
-        return causal_mask
+        self.register_buffer("backbone_causal_mask", _create_causal_mask(max_cache_len, device))
+        self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
 
     def generate_frame(
         self,
