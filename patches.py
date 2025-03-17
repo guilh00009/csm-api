@@ -278,6 +278,65 @@ def patch_torchtune_kv_cache():
         traceback.print_exc()
         return False
 
+def patch_kv_cache():
+    """
+    Patch torchtune's KVCache implementation to fix update method.
+    """
+    try:
+        if not importlib.util.find_spec("torchtune"):
+            print("torchtune not found, skipping KVCache patch")
+            return False
+
+        import torchtune.modules.kv_cache
+        
+        # Store the original update method
+        original_update = torchtune.modules.kv_cache.KVCache.update
+        
+        # Define a patched version of the update method
+        def patched_update(self, k_val, v_val):
+            """Patched version of KVCache.update that ensures dtype consistency"""
+            try:
+                # Check for dtype mismatch
+                k_cache_dtype = next(iter(self.buffers())).dtype if len(list(self.buffers())) > 0 else None
+                
+                # Convert inputs to match cache dtype if needed
+                if k_cache_dtype is not None and k_val.dtype != k_cache_dtype:
+                    k_val = k_val.to(dtype=k_cache_dtype)
+                    v_val = v_val.to(dtype=k_cache_dtype)
+                
+                return original_update(self, k_val, v_val)
+            except (RuntimeError, TypeError) as e:
+                if "dtypes match" in str(e) or "Index put" in str(e):
+                    # Handle dtype mismatch specifically
+                    print(f"KVCache dtype mismatch detected. Input: {k_val.dtype}, Cache: {k_cache_dtype}")
+                    print("Attempting to convert tensors for compatibility...")
+                    
+                    # Get the cache dtypes
+                    k_cache = self.k_cache if hasattr(self, 'k_cache') else None
+                    if k_cache is not None:
+                        # Convert inputs to match cache
+                        k_val = k_val.to(dtype=k_cache.dtype)
+                        v_val = v_val.to(dtype=k_cache.dtype)
+                    else:
+                        # No cache reference, try to convert to bfloat16
+                        k_val = k_val.to(dtype=torch.bfloat16)
+                        v_val = v_val.to(dtype=torch.bfloat16)
+                    
+                    # Try again with converted dtypes
+                    return original_update(self, k_val, v_val)
+                else:
+                    # Reraise other errors
+                    raise
+        
+        # Apply the patch
+        torchtune.modules.kv_cache.KVCache.update = patched_update
+        print("Successfully patched KVCache.update")
+        
+        return True
+    except Exception as e:
+        print(f"Failed to patch KVCache: {e}")
+        return False
+
 def apply_all_patches():
     """Apply all patches."""
     patches_applied = []
@@ -288,6 +347,9 @@ def apply_all_patches():
     
     if patch_torchtune_kv_cache():
         patches_applied.append("torchtune_kv_cache")
+    
+    if patch_kv_cache():
+        patches_applied.append("torchtune_kv_cache_fixed")
     
     if patches_applied:
         print(f"Applied patches: {', '.join(patches_applied)}")

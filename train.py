@@ -567,9 +567,12 @@ def main():
         Returns:
             loss: scalar loss value
         """
+        # Get model's dtype to ensure consistency
+        dtype = next(self.parameters()).dtype
+        
         # Keep values as integers for embedding indices
-        # Only convert to GLOBAL_DTYPE for value tensors, not index tensors
-        frames_values = frames.to(dtype=GLOBAL_DTYPE)
+        # Only convert to model's dtype for value tensors, not index tensors
+        frames_values = frames.to(dtype=dtype)
         
         b, s, _ = frames.size()
         
@@ -577,6 +580,9 @@ def main():
         embeds = self._embed_tokens(frames)
         masked_embeds = embeds * frames_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
+        
+        # Ensure h is the right dtype
+        h = h.to(dtype=dtype)
         
         # Create causal mask
         device = h.device
@@ -594,7 +600,21 @@ def main():
             backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
         else:
             # Use the backbone with KV caching as normal
-            backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+            try:
+                backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+            except RuntimeError as e:
+                if "dtypes match" in str(e) or "Index put" in str(e):
+                    print("Dtype mismatch during forward pass. Falling back to non-cached version.")
+                    # Disable KV cache and try again
+                    global DISABLE_KV_CACHE
+                    DISABLE_KV_CACHE = True
+                    self.backbone.reset_caches()
+                    backbone_out = self.backbone(h, input_pos=positions, mask=batch_mask)
+                else:
+                    raise
+                    
+        # Ensure backbone output is the right dtype
+        backbone_out = backbone_out.to(dtype=dtype)
         
         # Compute loss for text tokens (last dimension)
         text_logits = self.text_embeddings.weight @ backbone_out.transpose(1, 2)
@@ -613,8 +633,14 @@ def main():
                 # Project backbone output to decoder dimension
                 decoder_input = self.projection(backbone_out)
                 
+                # Ensure decoder input is the right dtype
+                decoder_input = decoder_input.to(dtype=dtype)
+                
                 # Forward pass through decoder
                 decoder_out = self.decoder(decoder_input, input_pos=positions, mask=batch_mask)
+                
+                # Ensure decoder output is the right dtype
+                decoder_out = decoder_out.to(dtype=dtype)
                 
                 # Compute logits for current codebook
                 audio_logits = torch.einsum("bsd,dv->bsv", decoder_out, self.audio_head[i-1])
@@ -745,22 +771,52 @@ def main():
     else:
         try:
             # Setup caches with the proper dtype
+            print(f"Setting up KV caches with dtype {GLOBAL_DTYPE}")
             with torch.amp.autocast('cuda', enabled=False):
+                # Force same dtype for all operations
+                for module in model.modules():
+                    # Check if module has buffers we need to track
+                    if hasattr(module, 'register_buffer'):
+                        # Make sure all new buffers will use the global dtype
+                        module._register_buffer_orig = module.register_buffer if hasattr(module, '_register_buffer_orig') else module.register_buffer
+                        
+                        def dtype_safe_register_buffer(name, tensor, persistent=True):
+                            # Ensure all registered buffers use the global dtype for consistency
+                            if tensor is not None and tensor.dtype != torch.bool and tensor.dtype != torch.long:
+                                tensor = tensor.to(dtype=GLOBAL_DTYPE)
+                            return module._register_buffer_orig(name, tensor, persistent)
+                        
+                        module.register_buffer = dtype_safe_register_buffer
+                
+                # Now setup the caches
                 model.setup_caches(args.batch_size)
-                # Ensure KV caches use the same dtype as the model
+                
+                # Ensure KV caches use the consistent dtype
                 for name, param in model.named_buffers():
-                    if 'cache' in name:
-                        param.data = param.data.to(dtype=GLOBAL_DTYPE)
+                    if 'cache' in name and 'pos' not in name:
+                        if param.dtype != GLOBAL_DTYPE:
+                            print(f"Converting KV cache buffer {name} from {param.dtype} to {GLOBAL_DTYPE}")
+                            param.data = param.data.to(dtype=GLOBAL_DTYPE)
                     # Ensure cache positions are Long to avoid index errors
                     if 'cache_pos' in name:
                         param.data = param.data.long()
+                
+                # Restore original register_buffer method
+                for module in model.modules():
+                    if hasattr(module, '_register_buffer_orig'):
+                        module.register_buffer = module._register_buffer_orig
+                
+                print("KV caches initialized successfully with consistent dtypes")
+                
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 print("Warning: Not enough GPU memory for KV caches. Training without KV caches.")
                 # Continue without KV caches
                 DISABLE_KV_CACHE = True
             else:
-                raise e
+                print(f"Error setting up KV caches: {e}")
+                print("Continuing without KV caching...")
+                DISABLE_KV_CACHE = True
     
     # Training loop
     for epoch in range(start_epoch, args.num_epochs):
