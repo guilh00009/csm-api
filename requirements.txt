@@ -3,11 +3,13 @@ torchaudio==2.4.0
 tokenizers==0.21.0
 transformers==4.49.0
 huggingface_hub==0.28.1
+datasets==2.18.0
 moshi==0.2.2
 torchtune==0.4.0
 torchao==0.9.0
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
 flask==2.3.3
 numpy>=1.26.0,<2.3
+tqdm>=4.66.0
 # For Windows users, uncomment the line below and comment out the torch line above
 # triton-windows

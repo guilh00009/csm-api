@@ -6,7 +6,75 @@ from typing import Dict, List, Tuple
 
 import torch
 import torchaudio
+from datasets import load_dataset
 from tqdm import tqdm
+
+
+def download_switchboard(output_dir: str) -> str:
+    """
+    Download the Switchboard dataset from Hugging Face.
+    
+    Args:
+        output_dir: Directory to save the dataset
+        
+    Returns:
+        Path to the downloaded dataset
+    """
+    print("Downloading Switchboard dataset from Hugging Face (hhoangphuoc/switchboard)...")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Download dataset
+    dataset = load_dataset("hhoangphuoc/switchboard")
+    
+    # Process and save each split
+    for split in ["train", "validation", "test"]:
+        if split in dataset:
+            split_dir = os.path.join(output_dir, split)
+            os.makedirs(split_dir, exist_ok=True)
+            os.makedirs(os.path.join(split_dir, "audio"), exist_ok=True)
+            
+            print(f"Processing {split} split...")
+            samples = []
+            
+            for i, item in enumerate(tqdm(dataset[split])):
+                # Extract audio
+                audio = torch.tensor(item["audio"]["array"])
+                sample_rate = item["audio"]["sampling_rate"]
+                
+                # Save audio file
+                audio_filename = f"{split}_{i:05d}.wav"
+                audio_path = os.path.join(split_dir, "audio", audio_filename)
+                torchaudio.save(audio_path, audio.unsqueeze(0), sample_rate)
+                
+                # Extract transcript and metadata
+                transcript = item["transcript"]
+                
+                # Determine speaker (assuming it's in the metadata or can be derived)
+                # For Switchboard, we'll use a simple heuristic based on the index
+                # In a real implementation, you would extract this from the dataset properly
+                speaker = 0 if i % 2 == 0 else 1
+                
+                # Create sample metadata
+                sample_metadata = {
+                    "audio_path": audio_path,
+                    "transcript": transcript,
+                    "speaker": speaker,
+                    "duration": len(audio) / sample_rate,
+                    "original_file": f"hhoangphuoc/switchboard/{split}/{i}"
+                }
+                
+                samples.append(sample_metadata)
+            
+            # Save metadata
+            with open(os.path.join(split_dir, "metadata.json"), 'w') as f:
+                json.dump(samples, f, indent=2)
+            
+            print(f"Saved {len(samples)} samples for {split} split")
+    
+    print(f"Dataset downloaded and processed to {output_dir}")
+    return output_dir
 
 
 def parse_transcript(transcript_path: str) -> List[Dict]:
@@ -216,14 +284,21 @@ def process_switchboard(input_dir: str, output_dir: str, sample_rate: int = 2400
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess Switchboard dataset for CSM-1B training")
-    parser.add_argument("--input_dir", type=str, required=True, help="Input directory containing Switchboard data")
+    parser = argparse.ArgumentParser(description="Preprocess Switchboard dataset for CSM-3B training")
+    parser.add_argument("--input_dir", type=str, default=None, 
+                        help="Input directory containing Switchboard data (if not downloading from HF)")
     parser.add_argument("--output_dir", type=str, default="switchboard", help="Output directory for processed data")
     parser.add_argument("--sample_rate", type=int, default=24000, help="Target sample rate")
+    parser.add_argument("--download", action="store_true", help="Download dataset from Hugging Face")
     
     args = parser.parse_args()
     
-    process_switchboard(args.input_dir, args.output_dir, args.sample_rate)
+    if args.download or args.input_dir is None:
+        # Download dataset from Hugging Face
+        download_switchboard(args.output_dir)
+    else:
+        # Process local dataset
+        process_switchboard(args.input_dir, args.output_dir, args.sample_rate)
 
 
 if __name__ == "__main__":

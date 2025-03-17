@@ -10,21 +10,26 @@ This repository contains code for training the CSM-3B (Conversational Speech Mod
 pip install -r requirements.txt
 ```
 
-2. Download the Switchboard dataset. The dataset can be obtained from [LDC](https://catalog.ldc.upenn.edu/LDC97S62).
+2. The Switchboard dataset will be automatically downloaded from Hugging Face (hhoangphuoc/switchboard) during preprocessing.
 
 ## Preprocessing
 
-Before training, you need to preprocess the Switchboard dataset:
+To preprocess the Switchboard dataset:
+
+```bash
+python preprocess_switchboard.py --download
+```
+
+This will:
+- Download the dataset from Hugging Face (hhoangphuoc/switchboard)
+- Process all audio files and their transcripts
+- Save the processed data to the "switchboard" directory
+
+If you already have the Switchboard dataset locally, you can process it with:
 
 ```bash
 python preprocess_switchboard.py --input_dir /path/to/switchboard --output_dir switchboard
 ```
-
-This will:
-- Process all audio files and their transcripts
-- Segment the audio based on utterances
-- Create train/validation/test splits
-- Save metadata in JSON format
 
 ## Training
 
@@ -58,6 +63,8 @@ The Switchboard dataset contains telephone conversations between two speakers. T
 - Upsample audio to 16kHz
 - Separate channels for different speakers
 - Process transcripts with special markers for paralinguistic events (laughter, etc.)
+
+The dataset is automatically downloaded from the Hugging Face repository [hhoangphuoc/switchboard](https://huggingface.co/datasets/hhoangphuoc/switchboard).
 
 ## Inference
 
