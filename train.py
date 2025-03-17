@@ -587,11 +587,11 @@ def main():
         # Ensure h is the right dtype
         h = h.to(dtype=dtype)
         
-        # Create proper attention mask compatible with multi-head attention
-        # This is a key fix for the dimension mismatch
+        # Create proper causal mask for attention - critical for KV cache mode
         device = h.device
-        # Simple mask to prevent looking into the future
-        mask = None
+        # Simple causal mask - prevent looking into the future
+        # This proper triangular mask is needed for KV caching
+        causal_mask = torch.tril(torch.ones(s, s, dtype=torch.bool, device=device))
         
         # Forward pass through backbone - handle disabled KV cache mode
         if DISABLE_KV_CACHE:
@@ -600,23 +600,26 @@ def main():
                 self.backbone.reset_caches()
             
             # Use the backbone without any KV cache operations
-            # Pass the input position and mask directly
-            backbone_out = self.backbone(h, input_pos=positions)
+            backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
         else:
             # Use the backbone with KV caching as normal
             try:
-                backbone_out = self.backbone(h, input_pos=positions)
+                # When using KV cache, a causal mask is required
+                backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
             except RuntimeError as e:
                 if "dtypes match" in str(e) or "Index put" in str(e):
                     print("Dtype mismatch during forward pass. Falling back to non-cached version.")
                     # Disable KV cache and try again
                     DISABLE_KV_CACHE = True
                     self.backbone.reset_caches()
-                    backbone_out = self.backbone(h, input_pos=positions)
+                    backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
                 elif "expanded size" in str(e) or "must match" in str(e):
-                    print("Dimension mismatch in attention. Trying without explicit mask.")
-                    backbone_out = self.backbone(h, input_pos=positions)
+                    print("Dimension mismatch in attention. Disabling KV cache and trying again.")
+                    DISABLE_KV_CACHE = True
+                    self.backbone.reset_caches()
+                    backbone_out = self.backbone(h, input_pos=positions, mask=causal_mask)
                 else:
+                    print(f"Unknown error during backbone forward pass: {e}")
                     raise
                     
         # Ensure backbone output is the right dtype
@@ -642,8 +645,8 @@ def main():
                 # Ensure decoder input is the right dtype
                 decoder_input = decoder_input.to(dtype=dtype)
                 
-                # Forward pass through decoder - no mask for consistency
-                decoder_out = self.decoder(decoder_input, input_pos=positions)
+                # Forward pass through decoder - include causal mask
+                decoder_out = self.decoder(decoder_input, input_pos=positions, mask=causal_mask)
                 
                 # Ensure decoder output is the right dtype
                 decoder_out = decoder_out.to(dtype=dtype)
@@ -795,12 +798,14 @@ def main():
                         module.register_buffer = dtype_safe_register_buffer
                 
                 # Try to safely set up caches with reduced size if needed
+                max_cache_len = 512  # Very conservative to start
+                
                 try:
                     # Use a more conservative max_seq_len to avoid dimension issues
                     orig_max_seq_len = model.backbone.max_seq_len
-                    if hasattr(model.backbone, 'max_seq_len') and model.backbone.max_seq_len > 2048:
-                        print(f"Reducing max_seq_len from {model.backbone.max_seq_len} to 2048 for safer caching")
-                        model.backbone.max_seq_len = 2048
+                    if hasattr(model.backbone, 'max_seq_len') and model.backbone.max_seq_len > max_cache_len:
+                        print(f"Reducing max_seq_len from {model.backbone.max_seq_len} to {max_cache_len} for safer caching")
+                        model.backbone.max_seq_len = max_cache_len
                     
                     # Now setup the caches with reduced dimensions
                     model.setup_caches(args.batch_size)
@@ -808,6 +813,7 @@ def main():
                     # Restore original max_seq_len if we changed it
                     if hasattr(model.backbone, 'max_seq_len') and orig_max_seq_len != model.backbone.max_seq_len:
                         model.backbone.max_seq_len = orig_max_seq_len
+                        print(f"Restored original max_seq_len: {orig_max_seq_len}")
                 except Exception as e:
                     print(f"Error during cache setup: {e}")
                     print("Falling back to no caching")
@@ -823,6 +829,13 @@ def main():
                     # Ensure cache positions are Long to avoid index errors
                     if 'cache_pos' in name:
                         param.data = param.data.long()
+                
+                # Make sure Model has proper causal_mask buffer for attention
+                # Create a conservative causal mask buffer for use during training
+                if not hasattr(model, 'causal_mask') or model.causal_mask.size(0) < max_cache_len:
+                    print(f"Creating causal mask buffer with size {max_cache_len}")
+                    causal_mask = torch.tril(torch.ones(max_cache_len, max_cache_len, dtype=torch.bool, device=args.device))
+                    model.register_buffer('causal_mask', causal_mask, persistent=False)
                 
                 # Restore original register_buffer method
                 for module in model.modules():
