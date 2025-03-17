@@ -41,17 +41,20 @@ def apply_early_patches():
                 print("Using direct implementation...")
                 
                 with torch.no_grad():
+                    # Use device-safe approach
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    
                     # Conservative implementation
                     dim = self.dim
                     max_seq_len = min(self.max_seq_len, 4096)  # Cap at 4K
                     
                     # Direct calculation
                     half_dim = dim // 2
-                    freqs = torch.arange(0, half_dim, 2, device=self.device).float()
+                    freqs = torch.arange(0, half_dim, 2, device=device).float()
                     freqs = 1.0 / (10000.0 ** (freqs / half_dim))
                     
                     # Create position indices and outer product
-                    seq_idx = torch.arange(max_seq_len, device=self.device).float()
+                    seq_idx = torch.arange(max_seq_len, device=device).float()
                     emb = torch.outer(seq_idx, freqs)
                     
                     # Calculate cos/sin
@@ -440,6 +443,9 @@ def load_checkpoint(
 
 
 def main():
+    # Access the global variable
+    global DISABLE_KV_CACHE
+    
     parser = argparse.ArgumentParser(description="Train CSM-3B model on Switchboard dataset")
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
