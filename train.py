@@ -142,12 +142,15 @@ class SwitchboardDataset(Dataset):
                 audio, orig_freq=sample_rate, new_freq=self.audio_tokenizer.sample_rate
             )
         
+        # Make sure audio is on CPU
+        audio = audio.to("cpu")
+        
         # Tokenize text
         text = sample["transcript"]
         speaker = sample["speaker"]
         text_tokens = self.tokenizer.encode(f"[{speaker}]{text}")
         
-        # Tokenize audio
+        # Tokenize audio - ensure it's on CPU
         audio_tokens = self.audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
         
         # Create frame tokens and masks
@@ -481,11 +484,10 @@ def main():
     # Set up tokenizers
     text_tokenizer = load_llama3_tokenizer()
     
-    # Load audio tokenizer (MIMI)
-    device = next(model.parameters()).device
-    # Fix: Use the correct method to get MIMI weights
+    # Load audio tokenizer (MIMI) on CPU first
     mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
-    audio_tokenizer = loaders.get_mimi(mimi_weight, device=device)
+    # Load MIMI on CPU first to avoid device mismatch issues
+    audio_tokenizer = loaders.get_mimi(mimi_weight, device="cpu")
     audio_tokenizer.set_num_codebooks(args.audio_num_codebooks)
     
     # Set up datasets and dataloaders
