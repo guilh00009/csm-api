@@ -21,10 +21,23 @@ bash install_dependencies.sh || {
 # Make sure Python environment variables are set correctly
 export PYTHONPATH="$(pwd):$PYTHONPATH"
 
+# Check if fix_and_run.py exists and run it if available
+if [ -f fix_and_run.py ]; then
+    echo "Running fix_and_run.py to apply RoPE patches and start training..."
+    python fix_and_run.py
+    exit $?
+fi
+
+# If fix_and_run.py is not available, run fix_rope.py if it exists
+if [ -f fix_rope.py ]; then
+    echo "Applying RoPE fixes from fix_rope.py..."
+    python fix_rope.py
+fi
+
 # Check if patches.py exists
 if [ ! -f patches.py ]; then
-    echo "patches.py not found. This file is required to fix library compatibility issues."
-    exit 1
+    echo "Warning: patches.py not found. This file is required to fix library compatibility issues."
+    echo "Continuing without patches..."
 fi
 
 # Download and preprocess the dataset
