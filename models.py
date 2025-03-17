@@ -22,22 +22,6 @@ def llama3_2_1B() -> torchtune.modules.transformer.TransformerDecoder:
     )
 
 
-def llama3_2_3B_instruct() -> torchtune.modules.transformer.TransformerDecoder:
-    return llama3_2.llama3_2(
-        vocab_size=128_256,
-        num_layers=28,
-        num_heads=24,
-        num_kv_heads=8,
-        embed_dim=3072,
-        max_seq_len=4096,
-        intermediate_dim=8192,
-        attn_dropout=0.0,
-        norm_eps=1e-5,
-        rope_base=10000.0,
-        scale_factor=1.0,
-    )
-
-
 def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
     return llama3_2.llama3_2(
         vocab_size=128_256,
@@ -56,7 +40,6 @@ def llama3_2_100M() -> torchtune.modules.transformer.TransformerDecoder:
 
 FLAVORS = {
     "llama-1B": llama3_2_1B,
-    "llama-3B-instruct": llama3_2_3B_instruct,
     "llama-100M": llama3_2_100M,
 }
 
@@ -87,7 +70,7 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
 
 def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs).exponential_(1)
-    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.long)  # Explicitly use long dtype
+    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
@@ -100,8 +83,7 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
     probs = torch.nn.functional.softmax(scores_processed, dim=-1)
 
     sample_token = _multinomial_sample_one_no_sync(probs)
-    # Ensure output is long integer type
-    return sample_token.long()
+    return sample_token
 
 
 @dataclass
@@ -133,17 +115,11 @@ class Model(nn.Module):
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
-        # Limit the maximum sequence length for caching to avoid OOM
-        max_cache_len = min(8192, self.backbone.max_seq_len)
-
         with device:
-            # The TransformerDecoder.setup_caches() doesn't accept max_seq_len parameter
-            # We'll use the default max_seq_len from the model initialization
             self.backbone.setup_caches(max_batch_size, dtype)
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
 
-        # Still use the limited max_cache_len for the causal mask
-        self.register_buffer("backbone_causal_mask", _create_causal_mask(max_cache_len, device))
+        self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
 
     def generate_frame(
@@ -205,17 +181,12 @@ class Model(nn.Module):
         self.decoder.reset_caches()
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
-        # Ensure indices are long type for embedding
-        indices = (tokens + codebook * self.args.audio_vocab_size).long()
-        return self.audio_embeddings(indices)
+        return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        # Ensure indices are long type for embedding
-        text_indices = tokens[:, :, -1].long()
-        text_embeds = self.text_embeddings(text_indices).unsqueeze(-2)
+        text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
 
-        # Ensure audio indices are long type
-        audio_tokens = tokens[:, :, :-1].long() + (
+        audio_tokens = tokens[:, :, :-1] + (
             self.args.audio_vocab_size * torch.arange(self.args.audio_num_codebooks, device=tokens.device)
         )
         audio_embeds = self.audio_embeddings(audio_tokens.view(-1)).reshape(

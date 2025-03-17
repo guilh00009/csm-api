@@ -2,7 +2,7 @@ import requests
 import json
 
 # Define the API endpoint
-url = "https://4u9hh5rz7jyrll-3000.proxy.runpod.net/api/tts/generate"
+url = "https://ae66sof6djvf45-3000.proxy.runpod.net/api/tts/generate"
 
 # Define the request payload
 data = {
