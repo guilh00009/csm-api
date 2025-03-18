@@ -174,6 +174,8 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
     model = Model(model_args).to(device=device, dtype=torch.bfloat16)
     state_dict = torch.load(ckpt_path)
     model.load_state_dict(state_dict)
+    
+    model.decoder = torch.compile(model.decoder, fullgraph=True, mode='reduce-overhead')
 
     generator = Generator(model)
     return generator
