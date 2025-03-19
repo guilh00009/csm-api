@@ -1,6 +1,7 @@
 import os
 import tempfile
 import base64
+import asyncio
 from pathlib import Path
 import torch
 import torchaudio
@@ -39,8 +40,37 @@ def load_audio(audio_path):
     )
     return audio_tensor
 
+# Helper function to process context segments
+async def process_context_segments(context_data):
+    segments = []
+    for ctx in context_data:
+        if 'text' not in ctx or 'speaker' not in ctx or 'audio_base64' not in ctx:
+            raise ValueError("Context segments must contain text, speaker, and audio_base64")
+        
+        # Decode base64 audio and save to temp file
+        audio_bytes = base64.b64decode(ctx['audio_base64'])
+        temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        with open(temp_audio.name, 'wb') as f:
+            f.write(audio_bytes)
+        
+        # Load audio in a non-blocking way
+        loop = asyncio.get_event_loop()
+        audio_tensor = await loop.run_in_executor(None, load_audio, temp_audio.name)
+        
+        # Create segment
+        segments.append(Segment(
+            text=ctx['text'],
+            speaker=ctx['speaker'],
+            audio=audio_tensor
+        ))
+        
+        # Clean up temp file
+        os.unlink(temp_audio.name)
+    
+    return segments
+
 @app.route('/api/tts/generate', methods=['POST'])
-def generate_speech():
+async def generate_speech():
     """
     Generate speech from text without context
     
@@ -65,18 +95,25 @@ def generate_speech():
         temperature = data.get('temperature', 0.9)
         return_format = data.get('return_format', 'url')
         
-        # Generate audio
-        audio = tts_generator.generate(
-            text=text,
-            speaker=speaker,
-            context=[],
-            max_audio_length_ms=max_audio_length_ms,
-            temperature=temperature,
+        # Generate audio in a non-blocking way
+        loop = asyncio.get_event_loop()
+        audio = await loop.run_in_executor(
+            None,
+            lambda: tts_generator.generate(
+                text=text,
+                speaker=speaker,
+                context=[],
+                max_audio_length_ms=max_audio_length_ms,
+                temperature=temperature,
+            )
         )
         
         # Save audio to a temporary file
         temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        torchaudio.save(temp_file.name, audio.unsqueeze(0).cpu(), tts_generator.sample_rate)
+        await loop.run_in_executor(
+            None,
+            lambda: torchaudio.save(temp_file.name, audio.unsqueeze(0).cpu(), tts_generator.sample_rate)
+        )
         
         if return_format == 'base64':
             # Return audio as base64
@@ -99,7 +136,7 @@ def generate_speech():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tts/generate_with_context', methods=['POST'])
-def generate_speech_with_context():
+async def generate_speech_with_context():
     """
     Generate speech from text with context
     
@@ -134,42 +171,27 @@ def generate_speech_with_context():
         return_format = data.get('return_format', 'url')
         
         # Process context segments
-        segments = []
-        for ctx in context_data:
-            if 'text' not in ctx or 'speaker' not in ctx or 'audio_base64' not in ctx:
-                return jsonify({"error": "Context segments must contain text, speaker, and audio_base64"}), 400
-            
-            # Decode base64 audio and save to temp file
-            audio_bytes = base64.b64decode(ctx['audio_base64'])
-            temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            with open(temp_audio.name, 'wb') as f:
-                f.write(audio_bytes)
-            
-            # Load audio
-            audio_tensor = load_audio(temp_audio.name)
-            
-            # Create segment
-            segments.append(Segment(
-                text=ctx['text'],
-                speaker=ctx['speaker'],
-                audio=audio_tensor
-            ))
-            
-            # Clean up temp file
-            os.unlink(temp_audio.name)
+        segments = await process_context_segments(context_data)
         
-        # Generate audio with context
-        audio = tts_generator.generate(
-            text=text,
-            speaker=speaker,
-            context=segments,
-            max_audio_length_ms=max_audio_length_ms,
-            temperature=temperature,
+        # Generate audio in a non-blocking way
+        loop = asyncio.get_event_loop()
+        audio = await loop.run_in_executor(
+            None,
+            lambda: tts_generator.generate(
+                text=text,
+                speaker=speaker,
+                context=segments,
+                max_audio_length_ms=max_audio_length_ms,
+                temperature=temperature,
+            )
         )
         
         # Save audio to a temporary file
         temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        torchaudio.save(temp_file.name, audio.unsqueeze(0).cpu(), tts_generator.sample_rate)
+        await loop.run_in_executor(
+            None,
+            lambda: torchaudio.save(temp_file.name, audio.unsqueeze(0).cpu(), tts_generator.sample_rate)
+        )
         
         if return_format == 'base64':
             # Return audio as base64
@@ -189,10 +211,12 @@ def generate_speech_with_context():
             })
             
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tts/generate_streaming', methods=['POST'])
-def generate_speech_streaming():
+async def generate_speech_streaming():
     """
     Generate speech from text and stream it as audio chunks using Server-Sent Events
     
@@ -236,73 +260,76 @@ def generate_speech_streaming():
         apply_watermark = data.get('apply_watermark', True)
         
         # Process context segments if provided
-        segments = []
-        for ctx in context_data:
-            if 'text' not in ctx or 'speaker' not in ctx or 'audio_base64' not in ctx:
-                return jsonify({"error": "Context segments must contain text, speaker, and audio_base64"}), 400
-            
-            # Decode base64 audio and save to temp file
-            audio_bytes = base64.b64decode(ctx['audio_base64'])
-            temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            with open(temp_audio.name, 'wb') as f:
-                f.write(audio_bytes)
-            
-            # Load audio
-            audio_tensor = load_audio(temp_audio.name)
-            
-            # Create segment
-            segments.append(Segment(
-                text=ctx['text'],
-                speaker=ctx['speaker'],
-                audio=audio_tensor
-            ))
-            
-            # Clean up temp file
-            os.unlink(temp_audio.name)
+        segments = await process_context_segments(context_data)
         
-        def generate():
+        async def generate():
             # Send sample rate and metadata information
             yield f"event: info\ndata: {json.dumps({'sample_rate': tts_generator.sample_rate})}\n\n"
             
             # Generate audio chunks
             chunk_id = 0
-            for chunk in tts_generator.generate_streaming(
+            loop = asyncio.get_event_loop()
+            
+            # Create a generator for streaming audio chunks
+            stream_generator = tts_generator.generate_streaming(
                 text=text,
                 speaker=speaker,
                 context=segments,
                 max_audio_length_ms=max_audio_length_ms,
                 temperature=temperature,
                 apply_watermark=apply_watermark,
-            ):
-                # Convert chunk to bytes
-                temp_chunk = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                torchaudio.save(temp_chunk.name, chunk.unsqueeze(0).cpu(), tts_generator.sample_rate)
-                
-                with open(temp_chunk.name, 'rb') as f:
-                    chunk_bytes = f.read()
-                
-                os.unlink(temp_chunk.name)
-                
-                # Yield chunk as SSE event with metadata
-                chunk_data = {
-                    'audio': base64.b64encode(chunk_bytes).decode('utf-8'),
-                    'sample_rate': tts_generator.sample_rate,
-                    'chunk_id': chunk_id
-                }
-                yield f"event: audio\ndata: {json.dumps(chunk_data)}\n\n"
-                chunk_id += 1
+            )
+            
+            # Process chunks asynchronously
+            while True:
+                try:
+                    # Get next chunk non-blockingly
+                    chunk = await loop.run_in_executor(None, lambda: next(stream_generator, None))
+                    if chunk is None:
+                        break
+                        
+                    # Process chunk asynchronously
+                    temp_chunk = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                    await loop.run_in_executor(
+                        None, 
+                        lambda: torchaudio.save(temp_chunk.name, chunk.unsqueeze(0).cpu(), tts_generator.sample_rate)
+                    )
+                    
+                    with open(temp_chunk.name, 'rb') as f:
+                        chunk_bytes = f.read()
+                    
+                    os.unlink(temp_chunk.name)
+                    
+                    # Yield chunk as SSE event with metadata
+                    chunk_data = {
+                        'audio': base64.b64encode(chunk_bytes).decode('utf-8'),
+                        'sample_rate': tts_generator.sample_rate,
+                        'chunk_id': chunk_id
+                    }
+                    yield f"event: audio\ndata: {json.dumps(chunk_data)}\n\n"
+                    chunk_id += 1
+                    
+                except StopIteration:
+                    # End of generator
+                    break
+                except Exception as e:
+                    # Handle any errors in chunk processing
+                    print(f"Error processing chunk: {e}")
+                    break
             
             # Signal end of stream with metadata
             yield f"event: end\ndata: {json.dumps({'sample_rate': tts_generator.sample_rate, 'total_chunks': chunk_id})}\n\n"
         
         # Return streaming response
-        return Response(stream_with_context(generate()), 
-                       mimetype='text/event-stream',
-                       headers={
-                           'Cache-Control': 'no-cache',
-                           'Connection': 'keep-alive',
-                           'X-Accel-Buffering': 'no'  # Disable buffering for Nginx
-                       })
+        return Response(
+            stream_with_context(generate()), 
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no'  # Disable buffering for Nginx
+            }
+        )
             
     except Exception as e:
         import traceback
@@ -310,13 +337,13 @@ def generate_speech_streaming():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/audio/<filename>')
-def serve_audio(filename):
+async def serve_audio(filename):
     """Serve generated audio files"""
     temp_dir = tempfile.gettempdir()
     return send_from_directory(temp_dir, filename)
 
 @app.route('/api/info', methods=['GET'])
-def get_info():
+async def get_info():
     """Get information about the TTS model"""
     return jsonify({
         "model": "CSM-1B",
