@@ -262,15 +262,12 @@ async def generate_speech_streaming():
         # Process context segments if provided
         segments = await process_context_segments(context_data)
         
-        async def generate():
-            # Send sample rate and metadata information
+        # Create a generator function that will be used with stream_with_context
+        def generate():
+            # First, yield the info event
             yield f"event: info\ndata: {json.dumps({'sample_rate': tts_generator.sample_rate})}\n\n"
             
-            # Generate audio chunks
-            chunk_id = 0
-            loop = asyncio.get_event_loop()
-            
-            # Create a generator for streaming audio chunks
+            # Create the streaming generator
             stream_generator = tts_generator.generate_streaming(
                 text=text,
                 speaker=speaker,
@@ -280,49 +277,33 @@ async def generate_speech_streaming():
                 apply_watermark=apply_watermark,
             )
             
-            # Process chunks asynchronously
-            while True:
-                try:
-                    # Get next chunk non-blockingly
-                    chunk = await loop.run_in_executor(None, lambda: next(stream_generator, None))
-                    if chunk is None:
-                        break
-                        
-                    # Process chunk asynchronously
-                    temp_chunk = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    await loop.run_in_executor(
-                        None, 
-                        lambda: torchaudio.save(temp_chunk.name, chunk.unsqueeze(0).cpu(), tts_generator.sample_rate)
-                    )
-                    
-                    with open(temp_chunk.name, 'rb') as f:
-                        chunk_bytes = f.read()
-                    
-                    os.unlink(temp_chunk.name)
-                    
-                    # Yield chunk as SSE event with metadata
-                    chunk_data = {
-                        'audio': base64.b64encode(chunk_bytes).decode('utf-8'),
-                        'sample_rate': tts_generator.sample_rate,
-                        'chunk_id': chunk_id
-                    }
-                    yield f"event: audio\ndata: {json.dumps(chunk_data)}\n\n"
-                    chunk_id += 1
-                    
-                except StopIteration:
-                    # End of generator
-                    break
-                except Exception as e:
-                    # Handle any errors in chunk processing
-                    print(f"Error processing chunk: {e}")
-                    break
+            # Process chunks one by one
+            chunk_id = 0
+            for chunk in stream_generator:
+                # Convert chunk to bytes
+                temp_chunk = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                torchaudio.save(temp_chunk.name, chunk.unsqueeze(0).cpu(), tts_generator.sample_rate)
+                
+                with open(temp_chunk.name, 'rb') as f:
+                    chunk_bytes = f.read()
+                
+                os.unlink(temp_chunk.name)
+                
+                # Yield chunk as SSE event
+                chunk_data = {
+                    'audio': base64.b64encode(chunk_bytes).decode('utf-8'),
+                    'sample_rate': tts_generator.sample_rate,
+                    'chunk_id': chunk_id
+                }
+                yield f"event: audio\ndata: {json.dumps(chunk_data)}\n\n"
+                chunk_id += 1
             
-            # Signal end of stream with metadata
+            # Signal end of stream
             yield f"event: end\ndata: {json.dumps({'sample_rate': tts_generator.sample_rate, 'total_chunks': chunk_id})}\n\n"
         
-        # Return streaming response
+        # Return streaming response with a regular (non-async) generator
         return Response(
-            stream_with_context(generate()), 
+            stream_with_context(generate()),
             mimetype='text/event-stream',
             headers={
                 'Cache-Control': 'no-cache',
